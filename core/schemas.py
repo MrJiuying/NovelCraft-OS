@@ -146,6 +146,10 @@ class WritingRule(BaseModel):
         ...,
         description="法则名称，例如番茄黄金三章或极简短句排版。",
     )
+    group: str = Field(
+        default="通用法则 (General)",
+        description="法则分组，用于在挂载舱中按主题归类展示。",
+    )
     category: Literal["Elements", "Theories", "Taboos", "Formatting", "Lore", "Tropes"] = Field(
         ...,
         description="法则类别，限定为 Elements/Theories/Taboos/Formatting/Lore/Tropes。",

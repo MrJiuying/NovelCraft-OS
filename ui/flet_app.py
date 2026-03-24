@@ -1,10 +1,13 @@
 import json
+import logging
 import os
 import sys
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 import flet as ft
 
@@ -28,6 +31,7 @@ from core.database import DB_PATH
 from core.database import init_character_traits_table
 from core.database import load_default_traits
 from core.database import save_active_traits
+from core.llm_client import generate_structured_data, generate_text
 from core.schemas import (
     BookOutline,
     ChapterOutlineList,
@@ -37,6 +41,13 @@ from core.schemas import (
     WritingRule,
 )
 from workflow.graph import run_chapter_pipeline
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+logger = logging.getLogger(__name__)
 
 STAGE_CONCEPT = "CONCEPT"
 STAGE_OUTLINE = "OUTLINE"
@@ -60,9 +71,11 @@ class AppState:
         self.current_stage: str = STAGE_CONCEPT
         self.chat_history: list[dict[str, str]] = []
         self.quick_options: list[str] = []
-        self.characters: list[dict[str, Any]] = []
-        self.world_settings: list[dict[str, Any]] = []
-        self.items: list[dict[str, Any]] = []
+        self.characters: dict[str, dict[str, Any]] = {}
+        self.world_settings: dict[str, dict[str, Any]] = {}
+        self.factions: dict[str, dict[str, Any]] = {}
+        self.items: dict[str, dict[str, Any]] = {}
+        self.timeline_events: dict[str, dict[str, Any]] = {}
         self.mounted_rules: list[WritingRule] = []
         self.model_entries: list[dict[str, str]] = []
         self.agent_aliases: dict[str, str] = {}
@@ -106,17 +119,28 @@ def _default_model_entries() -> list[dict[str, str]]:
     return [
         {
             "alias": "smart-default",
-            "api_key": "",
             "base_url": "",
             "model_name": SMART_MODEL,
         },
         {
             "alias": "fast-default",
-            "api_key": "",
             "base_url": "",
             "model_name": FAST_MODEL,
         },
     ]
+
+
+def _normalize_model_entries(entries: list[dict[str, str]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    for item in entries:
+        normalized.append(
+            {
+                "alias": str(item.get("alias", "")),
+                "base_url": str(item.get("base_url", "")),
+                "model_name": str(item.get("model_name", "")),
+            }
+        )
+    return normalized
 
 
 def _default_agent_aliases() -> dict[str, str]:
@@ -133,14 +157,18 @@ def _load_model_config() -> tuple[list[dict[str, str]], dict[str, str]]:
     if not path.exists():
         return _default_model_entries(), _default_agent_aliases()
     raw = json.loads(path.read_text(encoding="utf-8"))
-    entries = raw.get("models", _default_model_entries())
+    raw_entries = raw.get("models", _default_model_entries())
+    entries = _normalize_model_entries(raw_entries)
     aliases = raw.get("agent_mapping", _default_agent_aliases())
+    if entries != raw_entries:
+        _save_model_config(entries, aliases)
     return entries, aliases
 
 
 def _save_model_config(entries: list[dict[str, str]], aliases: dict[str, str]) -> None:
+    normalized_entries = _normalize_model_entries(entries)
     _model_config_path().write_text(
-        json.dumps({"models": entries, "agent_mapping": aliases}, ensure_ascii=False, indent=2),
+        json.dumps({"models": normalized_entries, "agent_mapping": aliases}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -366,6 +394,7 @@ def main(page: ft.Page) -> None:
         max_lines=12,
         hint_text="例如：李四在垃圾场捡到戒指...",
     )
+    workshop_volume_picker = ft.Dropdown(label="选择分卷", options=[])
     chapter_picker = ft.Dropdown(label="从章纲选中章节", options=[])
     active_environment_input = ft.TextField(
         label="环境",
@@ -409,19 +438,36 @@ def main(page: ft.Page) -> None:
         min_lines=2,
         max_lines=4,
     )
+    entity_category_picker = ft.Dropdown(
+        label="分类",
+        value="characters",
+        options=[
+            ft.dropdown.Option("characters", "👥 人物"),
+            ft.dropdown.Option("world_settings", "🌍 世界"),
+            ft.dropdown.Option("factions", "🏢 势力"),
+            ft.dropdown.Option("items", "💎 资产"),
+            ft.dropdown.Option("timeline_events", "📅 时间线"),
+        ],
+    )
+    entity_name_input = ft.TextField(label="名称")
     pipeline_output = ft.TextField(
-        label="章节正文",
+        label="章节正文（Markdown）",
         multiline=True,
-        min_lines=28,
-        read_only=True,
+        min_lines=24,
+        border=ft.InputBorder.NONE,
+        content_padding=12,
         expand=True,
     )
-    pipeline_stream = ft.ListView(expand=True, auto_scroll=True, spacing=4)
     pipeline_progress = ft.ProgressBar(visible=False, color=ft.Colors.BLUE_400)
+    workshop_word_count = ft.Text(value="字数: 0", text_align=ft.TextAlign.RIGHT)
 
     character_cards_box = ft.Column(spacing=10)
     world_cards_box = ft.Column(spacing=10)
     item_cards_box = ft.Column(spacing=10)
+    entity_list_view = ft.ListView(expand=True, spacing=6, auto_scroll=True)
+    entity_detail_box = ft.Container(expand=True)
+    selected_entity_ref: dict[str, str | None] = {"key": None}
+    entity_form_field_refs: dict[str, ft.TextField] = {}
     tactical_rules_box = ft.Column(spacing=6)
     rule_positive_box = ft.Column(spacing=6)
     rule_negative_box = ft.Column(spacing=6)
@@ -444,6 +490,8 @@ def main(page: ft.Page) -> None:
             ft.dropdown.Option("Tropes", "专属桥段"),
         ],
     )
+    rule_group_default_options = ["通用法则", "都市重生类", "科幻修真类", "《网吧AI》专属"]
+    rule_group_input = ft.TextField(label="🏷️ 所属分组 (Group)", value="通用法则 (General)")
     element_target_input = ft.TextField(label="要素解剖目标（仅 Elements 使用）", value="人物")
     rule_name_preview = ft.Text("法则名称：-", color=ft.Colors.BLUE_300)
     save_rule_btn = ft.Button("💾 保存到本地知识库", disabled=True)
@@ -529,6 +577,17 @@ def main(page: ft.Page) -> None:
         }
         return mapping.get(category, category)
 
+    def rule_category_icon(category: str) -> str:
+        mapping = {
+            "Elements": "🧩",
+            "Theories": "📘",
+            "Taboos": "⛔",
+            "Formatting": "✍️",
+            "Lore": "📜",
+            "Tropes": "🎭",
+        }
+        return mapping.get(category, "📌")
+
     def render_rule_result(rule: WritingRule | None) -> None:
         rule_positive_box.controls.clear()
         rule_negative_box.controls.clear()
@@ -536,6 +595,7 @@ def main(page: ft.Page) -> None:
             rule_name_preview.value = "法则名称：-"
             save_rule_btn.disabled = True
             return
+        rule_group_input.value = rule.group or "通用法则 (General)"
         rule_name_preview.value = f"法则名称：{rule.rule_name}（{rule_category_label(rule.category)}）"
         rule_positive_box.controls.extend(ft.Text(f"✅ {item}", color=ft.Colors.GREEN_300) for item in rule.positive_instructions)
         rule_negative_box.controls.extend(ft.Text(f"⛔ {item}", color=ft.Colors.RED_300) for item in rule.negative_constraints)
@@ -544,24 +604,39 @@ def main(page: ft.Page) -> None:
     def refresh_tactical_backpack() -> None:
         tactical_rules_box.controls.clear()
         mounted_ids = {item.rule_id for item in state.mounted_rules}
+        grouped_rules: dict[str, list[WritingRule]] = {}
         for rule in local_rules_cache:
-            def on_toggle(event: ft.ControlEvent, item: WritingRule = rule) -> None:
-                checked = bool(event.control.value)
-                existing = {entry.rule_id: entry for entry in state.mounted_rules}
-                if checked:
-                    existing[item.rule_id] = item
-                elif item.rule_id in existing:
-                    existing.pop(item.rule_id)
-                state.mounted_rules = list(existing.values())
-                save_full_archive()
-                set_status(f"战术背包已更新，共挂载 {len(state.mounted_rules)} 条法则。")
-                page.update()
+            group_name = (rule.group or "通用法则 (General)").strip() or "通用法则 (General)"
+            grouped_rules.setdefault(group_name, []).append(rule)
+        for group_name in sorted(grouped_rules.keys()):
+            controls: list[ft.Control] = []
+            for rule in grouped_rules[group_name]:
+                def on_toggle(event: ft.ControlEvent, item: WritingRule = rule) -> None:
+                    checked = bool(event.control.value)
+                    existing = {entry.rule_id: entry for entry in state.mounted_rules}
+                    if checked:
+                        existing[item.rule_id] = item
+                    elif item.rule_id in existing:
+                        existing.pop(item.rule_id)
+                    state.mounted_rules = list(existing.values())
+                    save_full_archive()
+                    set_status(f"战术背包已更新，共挂载 {len(state.mounted_rules)} 条法则。")
+                    page.update()
 
+                controls.append(
+                    ft.Checkbox(
+                        value=rule.rule_id in mounted_ids,
+                        label=(
+                            f"{rule_category_icon(rule.category)} {rule.rule_name} "
+                            f"（{rule_category_label(rule.category)} / {rule.applicable_stage}）"
+                        ),
+                        on_change=on_toggle,
+                    )
+                )
             tactical_rules_box.controls.append(
-                ft.Checkbox(
-                    value=rule.rule_id in mounted_ids,
-                    label=f"[{rule_category_label(rule.category)}] {rule.rule_name}（{rule.applicable_stage}）",
-                    on_change=on_toggle,
+                ft.ExpansionTile(
+                    title=ft.Text(f"📁 【{group_name}】（包含 {len(controls)} 条法则）"),
+                    controls=controls,
                 )
             )
         if not tactical_rules_box.controls:
@@ -643,10 +718,16 @@ def main(page: ft.Page) -> None:
             return
         if not rule.rule_id.strip():
             rule = rule.model_copy(update={"rule_id": datetime.now().strftime("rule_%Y%m%d_%H%M%S")})
+        group_value = (rule_group_input.value or "").strip() or "通用法则 (General)"
+        rule = rule.model_copy(update={"group": group_value})
         save_writing_rule(rule)
         latest_rule_ref["rule"] = rule
         reload_local_rules()
         set_status(f"法则已保存：{rule.rule_name}")
+        page.update()
+
+    def on_select_rule_group(_: ft.ControlEvent, group_name: str) -> None:
+        rule_group_input.value = group_name
         page.update()
 
     def get_project_name() -> str:
@@ -668,7 +749,16 @@ def main(page: ft.Page) -> None:
         return _project_dir_path(project_name) / "chapters"
 
     def _chapter_markdown_filename(volume_num: int, chapter_num: int) -> str:
+        return f"vol_{volume_num}_ch_{chapter_num}.md"
+
+    def _legacy_chapter_markdown_filename(volume_num: int, chapter_num: int) -> str:
         return f"v{volume_num}_c{chapter_num}.md"
+
+    def _chapter_relative_path(volume_num: int, chapter_num: int) -> str:
+        return f"chapters/{_chapter_markdown_filename(volume_num, chapter_num)}"
+
+    def _legacy_chapter_relative_path(volume_num: int, chapter_num: int) -> str:
+        return f"chapters/{_legacy_chapter_markdown_filename(volume_num, chapter_num)}"
 
     def _write_chapter_markdown(volume_num: int, chapter_num: int, text: str) -> str:
         chapters_dir = _project_chapters_dir(state.project_name)
@@ -676,7 +766,7 @@ def main(page: ft.Page) -> None:
         filename = _chapter_markdown_filename(volume_num, chapter_num)
         chapter_path = chapters_dir / filename
         chapter_path.write_text(text, encoding="utf-8")
-        return f"chapters/{filename}"
+        return _chapter_relative_path(volume_num, chapter_num)
 
     def _read_chapter_markdown(relative_path: str) -> str:
         path = _project_dir_path(state.project_name) / relative_path
@@ -793,7 +883,9 @@ def main(page: ft.Page) -> None:
             "active_traits": state.active_traits.model_dump() if state.active_traits else None,
             "characters": state.characters,
             "world_settings": state.world_settings,
+            "factions": state.factions,
             "items": state.items,
+            "timeline_events": state.timeline_events,
             "mounted_rule_ids": [item.rule_id for item in state.mounted_rules],
         }
         payload = {
@@ -810,7 +902,9 @@ def main(page: ft.Page) -> None:
             "active_traits": app_state_snapshot["active_traits"],
             "characters": app_state_snapshot["characters"],
             "world_settings": app_state_snapshot["world_settings"],
+            "factions": app_state_snapshot["factions"],
             "items": app_state_snapshot["items"],
+            "timeline_events": app_state_snapshot["timeline_events"],
             "mounted_rule_ids": app_state_snapshot["mounted_rule_ids"],
             "saved_at": datetime.now().isoformat(),
         }
@@ -853,6 +947,8 @@ def main(page: ft.Page) -> None:
         for path in sorted(_rules_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and (not str(payload.get("group", "")).strip()):
+                    payload["group"] = "通用法则 (General)"
                 rules.append(WritingRule.model_validate(payload))
             except Exception:
                 continue
@@ -941,12 +1037,6 @@ def main(page: ft.Page) -> None:
         controls: list[ft.Control] = []
         for idx, entry in enumerate(state.model_entries):
             alias_field = ft.TextField(label="模型别名", value=entry.get("alias", ""))
-            api_field = ft.TextField(
-                label="API Key",
-                value=entry.get("api_key", ""),
-                password=True,
-                can_reveal_password=True,
-            )
             base_url_field = ft.TextField(label="Base URL", value=entry.get("base_url", ""))
             model_name_field = ft.TextField(label="模型名称", value=entry.get("model_name", ""))
 
@@ -954,13 +1044,11 @@ def main(page: ft.Page) -> None:
                 _: ft.ControlEvent,
                 index: int = idx,
                 alias_ctrl: ft.TextField = alias_field,
-                api_ctrl: ft.TextField = api_field,
                 base_ctrl: ft.TextField = base_url_field,
                 model_ctrl: ft.TextField = model_name_field,
             ) -> None:
                 state.model_entries[index] = {
                     "alias": alias_ctrl.value or "",
-                    "api_key": api_ctrl.value or "",
                     "base_url": base_ctrl.value or "",
                     "model_name": model_ctrl.value or "",
                 }
@@ -971,7 +1059,6 @@ def main(page: ft.Page) -> None:
                 page.update()
 
             alias_field.on_blur = sync_entry
-            api_field.on_blur = sync_entry
             base_url_field.on_blur = sync_entry
             model_name_field.on_blur = sync_entry
 
@@ -985,7 +1072,6 @@ def main(page: ft.Page) -> None:
                             ft.Row(
                                 [
                                     alias_field,
-                                    api_field,
                                     base_url_field,
                                     model_name_field,
                                     ft.IconButton(
@@ -1024,7 +1110,6 @@ def main(page: ft.Page) -> None:
         state.model_entries.append(
             {
                 "alias": f"model-{len(state.model_entries) + 1}",
-                "api_key": "",
                 "base_url": "",
                 "model_name": SMART_MODEL,
             }
@@ -1050,7 +1135,7 @@ def main(page: ft.Page) -> None:
         env["DEEPSEEK_API_KEY"] = api_key_input.value or ""
         _save_env_map(env)
         os.environ["DEEPSEEK_API_KEY"] = api_key_input.value or ""
-        settings_status.value = "状态：API Key 已实时保存。"
+        settings_status.value = "状态：.env 中 DEEPSEEK_API_KEY 已实时保存。"
         page.update()
 
     supervisor_mapping_dropdown.on_change = on_mapping_change
@@ -1059,16 +1144,65 @@ def main(page: ft.Page) -> None:
     checker_mapping_dropdown.on_change = on_mapping_change
     api_key_input.on_blur = on_api_key_blur
 
+    def update_workshop_word_count(text: str) -> None:
+        workshop_word_count.value = f"字数: {len(text)}"
+
+    def _get_selected_workshop_volume() -> int | None:
+        selected = workshop_volume_picker.value
+        if not selected:
+            return None
+        try:
+            return int(selected)
+        except ValueError:
+            return None
+
+    def _get_selected_workshop_chapter() -> int | None:
+        selected = chapter_picker.value
+        if not selected:
+            return None
+        try:
+            return int(selected)
+        except ValueError:
+            return None
+
+    def _load_chapter_content_for_workshop(volume_num: int, chapter_num: int) -> str:
+        text_key = f"{volume_num}:{chapter_num}"
+        deduced_relative = _chapter_relative_path(volume_num, chapter_num)
+        loaded_text = _read_chapter_markdown(deduced_relative)
+        used_relative = deduced_relative if loaded_text else ""
+        if not loaded_text:
+            legacy_relative = _legacy_chapter_relative_path(volume_num, chapter_num)
+            loaded_text = _read_chapter_markdown(legacy_relative)
+            used_relative = legacy_relative if loaded_text else ""
+        if not loaded_text:
+            mapped_relative = state.chapter_files.get(text_key, "")
+            if mapped_relative and mapped_relative not in {deduced_relative, _legacy_chapter_relative_path(volume_num, chapter_num)}:
+                loaded_text = _read_chapter_markdown(mapped_relative)
+                used_relative = mapped_relative if loaded_text else ""
+        if loaded_text:
+            state.chapter_texts[text_key] = loaded_text
+            state.chapter_files[text_key] = used_relative or deduced_relative
+        return loaded_text
+
     def sync_chapter_picker() -> None:
+        volume_options: list[ft.dropdown.Option] = []
+        for volume_num in sorted(state.volumes.keys()):
+            outline = state.volumes.get(volume_num)
+            title = outline.volume_title if outline else ""
+            volume_options.append(ft.dropdown.Option(key=str(volume_num), text=f"第{volume_num}卷：{title}"))
+        workshop_volume_picker.options = volume_options
+        selected_volume = state.selected_volume_num if state.selected_volume_num in state.volumes else None
+        workshop_volume_picker.value = str(selected_volume) if selected_volume is not None else None
         options: list[ft.dropdown.Option] = []
-        if state.chapter_outline:
-            for chapter in state.chapter_outline.chapters:
+        chapter_outline = state.chapter_outlines.get(selected_volume) if selected_volume is not None else None
+        if chapter_outline:
+            for chapter in chapter_outline.chapters:
                 chapter_number = int(chapter.get("chapter_number", 0))
                 core_event = str(chapter.get("core_event", ""))
-                key = str(chapter_number)
-                options.append(ft.dropdown.Option(key=key, text=f"第{chapter_number}章：{core_event}"))
+                options.append(ft.dropdown.Option(key=str(chapter_number), text=f"第{chapter_number}章：{core_event}"))
         chapter_picker.options = options
-        chapter_picker.value = None
+        if chapter_picker.value not in {opt.key for opt in options}:
+            chapter_picker.value = None
 
     def sync_proposal_board() -> None:
         if state.concept_proposal is None:
@@ -1170,8 +1304,13 @@ def main(page: ft.Page) -> None:
             def on_send_to_workshop(_: ft.ControlEvent, number: int = chapter_number, idea: str = core_event) -> None:
                 chapter_num_input.value = str(number)
                 chapter_idea_input.value = idea
+                if state.selected_volume_num is not None:
+                    workshop_volume_picker.value = str(state.selected_volume_num)
+                sync_chapter_picker()
+                chapter_picker.value = str(number)
+                on_chapter_pick(_)
                 pipeline_status.value = f"状态：已从章节 {number} 发送到写作工坊。"
-                print(f"发送到写作工坊: 第{number}章")
+                logger.info("ui.send_to_workshop chapter=%s idea_chars=%s", number, len(idea))
                 if tabs_ref["tabs"] is not None:
                     tabs_ref["tabs"].selected_index = 2
                 page.update()
@@ -1535,9 +1674,11 @@ def main(page: ft.Page) -> None:
         state.volume_outline = None
         state.chapter_outline = None
         state.active_traits = None
-        state.characters = []
-        state.world_settings = []
-        state.items = []
+        state.characters = {}
+        state.world_settings = {}
+        state.factions = {}
+        state.items = {}
+        state.timeline_events = {}
         state.mounted_rules = []
         raw_chat = snapshot.get("chat_history", []) or []
         normalized_chat: list[dict[str, str]] = []
@@ -1611,10 +1752,14 @@ def main(page: ft.Page) -> None:
             state.active_traits = load_default_traits()
         chars = snapshot.get("characters")
         worlds = snapshot.get("world_settings")
+        factions = snapshot.get("factions")
         items = snapshot.get("items")
-        state.characters = chars if isinstance(chars, list) else []
-        state.world_settings = worlds if isinstance(worlds, list) else []
-        state.items = items if isinstance(items, list) else []
+        timeline_events = snapshot.get("timeline_events")
+        state.characters = chars if isinstance(chars, dict) else (chars if isinstance(chars, list) else {})
+        state.world_settings = worlds if isinstance(worlds, dict) else (worlds if isinstance(worlds, list) else {})
+        state.factions = factions if isinstance(factions, dict) else {}
+        state.items = items if isinstance(items, dict) else (items if isinstance(items, list) else {})
+        state.timeline_events = timeline_events if isinstance(timeline_events, dict) else {}
         mounted_ids = snapshot.get("mounted_rule_ids")
         if isinstance(mounted_ids, list):
             local_map = {item.rule_id: item for item in load_local_rules()}
@@ -1672,9 +1817,11 @@ def main(page: ft.Page) -> None:
             state.chapter_outlines = {}
             state.chapter_texts = {}
             state.chapter_files = {}
-            state.characters = []
-            state.world_settings = []
-            state.items = []
+            state.characters = {}
+            state.world_settings = {}
+            state.factions = {}
+            state.items = {}
+            state.timeline_events = {}
             state.mounted_rules = []
             state.selected_volume_num = None
             state.volume_outline = None
@@ -1772,281 +1919,449 @@ def main(page: ft.Page) -> None:
         page.update()
 
     def on_chapter_pick(_: ft.ControlEvent) -> None:
-        selected = chapter_picker.value or ""
-        if not selected or state.chapter_outline is None:
+        selected_volume = _get_selected_workshop_volume()
+        selected_chapter = _get_selected_workshop_chapter()
+        if selected_volume is None or selected_chapter is None:
             return
-        try:
-            selected_number = int(selected)
-        except ValueError:
+        chapter_outline = state.chapter_outlines.get(selected_volume)
+        if chapter_outline is None:
+            pipeline_output.value = ""
+            update_workshop_word_count("")
+            page.update()
             return
         matched = None
-        for chapter in state.chapter_outline.chapters:
-            if int(chapter.get("chapter_number", 0)) == selected_number:
+        for chapter in chapter_outline.chapters:
+            if int(chapter.get("chapter_number", 0)) == selected_chapter:
                 matched = chapter
                 break
         if matched is None:
             return
-        chapter_num_input.value = str(selected_number)
+        state.selected_volume_num = selected_volume
+        state.volume_outline = state.volumes.get(selected_volume)
+        state.chapter_outline = chapter_outline
+        chapter_num_input.value = str(selected_chapter)
         chapter_idea_input.value = str(matched.get("core_event", ""))
-        current_volume = state.selected_volume_num if state.selected_volume_num is not None else 0
-        text_key = f"{current_volume}:{selected_number}"
-        if text_key in state.chapter_texts:
-            loaded_text = state.chapter_texts.get(text_key, "")
-        else:
-            relative_path = state.chapter_files.get(text_key, "")
-            loaded_text = _read_chapter_markdown(relative_path) if relative_path else ""
-            if loaded_text:
-                state.chapter_texts[text_key] = loaded_text
+        loaded_text = _load_chapter_content_for_workshop(selected_volume, selected_chapter)
         pipeline_output.value = loaded_text
-        pipeline_stream.controls = [ft.Text(line) for line in loaded_text.splitlines()]
+        update_workshop_word_count(loaded_text)
         page.update()
 
+    def on_workshop_volume_pick(_: ft.ControlEvent) -> None:
+        selected_volume = _get_selected_workshop_volume()
+        if selected_volume is None:
+            return
+        state.selected_volume_num = selected_volume
+        state.volume_outline = state.volumes.get(selected_volume)
+        state.chapter_outline = state.chapter_outlines.get(selected_volume)
+        render_volume_cards()
+        render_outline_boards()
+        chapter_outline_box.value = state.chapter_outline.model_dump_json(indent=2) if state.chapter_outline else ""
+        sync_chapter_picker()
+        render_chapter_cards()
+        pipeline_output.value = ""
+        update_workshop_word_count("")
+        page.update()
+
+    def on_workshop_text_change(event: ft.ControlEvent) -> None:
+        current_text = event.control.value or ""
+        update_workshop_word_count(current_text)
+        page.update()
+
+    def on_save_current_chapter(_: ft.ControlEvent) -> None:
+        selected_volume = _get_selected_workshop_volume()
+        selected_chapter = _get_selected_workshop_chapter()
+        if selected_volume is None or selected_chapter is None:
+            pipeline_status.value = "状态：请先选择分卷与章节。"
+            page.update()
+            return
+        text_key = f"{selected_volume}:{selected_chapter}"
+        text = pipeline_output.value or ""
+        save_chapter_text(text_key, text)
+        save_full_archive()
+        pipeline_status.value = f"状态：第{selected_volume}卷 第{selected_chapter}章已保存。"
+        set_status("章节正文已保存到独立文件。")
+        page.update()
+
+    workshop_volume_picker.on_change = on_workshop_volume_pick
     chapter_picker.on_change = on_chapter_pick
+    pipeline_output.on_change = on_workshop_text_change
 
-    def build_character_tile(row: dict[str, Any], index: int) -> ft.ExpansionTile:
-        entity_id = ft.TextField(label="角色ID", value=str(row.get("entity_id", "")))
-        version_chapter = ft.TextField(label="版本章号", value=str(row.get("version_chapter", "")))
-        environment = ft.TextField(label="environment", value=str(row.get("environment", "")), multiline=True)
-        behavior = ft.TextField(label="behavior", value=str(row.get("behavior", "")), multiline=True)
-        capability = ft.TextField(label="capability", value=str(row.get("capability", "")), multiline=True)
-        values = ft.TextField(label="values", value=str(row.get("values", "")), multiline=True)
-        identity = ft.TextField(label="identity", value=str(row.get("identity", "")), multiline=True)
-        vision = ft.TextField(label="vision", value=str(row.get("vision", "")), multiline=True)
-        update_reason = ft.TextField(label="update_reason", value=str(row.get("update_reason", "")))
-
-        def save_character(_: ft.ControlEvent) -> None:
-            state.characters[index] = {
-                "id": row.get("id", index + 1),
-                "entity_id": entity_id.value or "",
-                "version_chapter": int(version_chapter.value or "1"),
-                "environment": environment.value or "",
-                "behavior": behavior.value or "",
-                "capability": capability.value or "",
-                "values": values.value or "",
-                "identity": identity.value or "",
-                "vision": vision.value or "",
-                "update_reason": update_reason.value or "UI更新",
-            }
-            save_full_archive()
-            render_character_cards()
-            page.update()
-
-        return ft.ExpansionTile(
-            title=ft.Text(f"人物卡：{row.get('entity_id', '')}"),
-            controls=[
-                entity_id,
-                version_chapter,
-                environment,
-                behavior,
-                capability,
-                values,
-                identity,
-                vision,
-                update_reason,
-                ft.Button(
-                    "保存人物卡",
-                    on_click=save_character,
-                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
-                ),
+    entity_schema: dict[str, dict[str, Any]] = {
+        "characters": {
+            "label": "👥 人物",
+            "default_name": "新人物",
+            "fields": [
+                ("environment", "环境 / Environment"),
+                ("behavior", "行为 / Behavior"),
+                ("capability", "能力 / Capability"),
+                ("values", "价值观 / Values"),
+                ("identity", "身份 / Identity"),
+                ("vision", "愿景 / Vision"),
             ],
-        )
-
-    def build_world_tile(row: dict[str, Any], index: int) -> ft.ExpansionTile:
-        region_name = ft.TextField(label="region_name", value=str(row.get("region_name", "")))
-        tech_level = ft.TextField(label="tech_level", value=str(row.get("tech_level", "")), multiline=True)
-        power_structure = ft.TextField(
-            label="power_structure", value=str(row.get("power_structure", "")), multiline=True
-        )
-        hidden_rules = ft.TextField(label="hidden_rules", value=str(row.get("hidden_rules", "")), multiline=True)
-
-        def save_world(_: ft.ControlEvent) -> None:
-            state.world_settings[index] = {
-                "id": row.get("id", index + 1),
-                "region_name": region_name.value or "",
-                "tech_level": tech_level.value or "",
-                "power_structure": power_structure.value or "",
-                "hidden_rules": hidden_rules.value or "",
-            }
-            save_full_archive()
-            render_world_cards()
-            page.update()
-
-        return ft.ExpansionTile(
-            title=ft.Text(f"世界卡：{row.get('region_name', '')}"),
-            controls=[
-                region_name,
-                tech_level,
-                power_structure,
-                hidden_rules,
-                ft.Button(
-                    "保存世界卡",
-                    on_click=save_world,
-                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
-                ),
+        },
+        "world_settings": {
+            "label": "🌍 世界",
+            "default_name": "新世界设定",
+            "fields": [
+                ("background_origin", "背景起源"),
+                ("core_rules", "核心规则"),
+                ("related_figures", "相关势力人物"),
+                ("current_status", "当前状态"),
             ],
-        )
-
-    def build_item_tile(row: dict[str, Any], index: int) -> ft.ExpansionTile:
-        item_name = ft.TextField(label="锚点名称", value=str(row.get("item_name", "")))
-        origin = ft.TextField(label="来历", value=str(row.get("origin", "")), multiline=True)
-        current_owner = ft.TextField(label="当前持有者", value=str(row.get("current_owner", "")))
-        hidden_power = ft.TextField(label="隐藏功效", value=str(row.get("hidden_power", "")), multiline=True)
-        item_function = ft.TextField(label="功能", value=str(row.get("item_function", "")), multiline=True)
-        story_hook = ft.TextField(label="剧情钩子", value=str(row.get("story_hook", "")), multiline=True)
-
-        def save_item(_: ft.ControlEvent) -> None:
-            state.items[index] = {
-                "id": row.get("id", index + 1),
-                "item_name": item_name.value or "",
-                "origin": origin.value or "",
-                "current_owner": current_owner.value or "",
-                "hidden_power": hidden_power.value or "",
-                "item_function": item_function.value or "",
-                "story_hook": story_hook.value or "",
-            }
-            save_full_archive()
-            render_item_cards()
-            page.update()
-
-        return ft.ExpansionTile(
-            title=ft.Text(f"剧情锚点/金手指：{row.get('item_name', '')}"),
-            controls=[
-                item_name,
-                origin,
-                current_owner,
-                hidden_power,
-                item_function,
-                story_hook,
-                ft.Button(
-                    "保存锚点卡",
-                    on_click=save_item,
-                    style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
-                ),
+        },
+        "factions": {
+            "label": "🏢 势力",
+            "default_name": "新势力",
+            "fields": [
+                ("core_business_assets", "核心业务与资产"),
+                ("key_figures", "关键人物"),
+                ("relation_to_protagonist", "与主角关系"),
+                ("development_vision", "发展愿景"),
             ],
+        },
+        "items": {
+            "label": "💎 资产",
+            "default_name": "新资产",
+            "fields": [
+                ("acquisition_source", "获取来源"),
+                ("core_function", "核心功能机制"),
+                ("usage_limits_cost", "使用限制与代价"),
+                ("strategic_meaning", "剧情战略意义"),
+            ],
+        },
+        "timeline_events": {
+            "label": "📅 时间线",
+            "default_name": "新时间线事件",
+            "fields": [
+                ("event_time", "发生时间"),
+                ("real_history_event", "真实历史事件"),
+                ("intervention_plan", "主角干预计划"),
+                ("butterfly_effect", "蝴蝶效应预测"),
+            ],
+        },
+    }
+
+    def _get_current_entity_category() -> str:
+        category = entity_category_picker.value or "characters"
+        return category if category in entity_schema else "characters"
+
+    def _entity_bucket(category: str) -> dict[str, dict[str, Any]]:
+        _normalize_legacy_entity_data()
+        mapping = {
+            "characters": state.characters,
+            "world_settings": state.world_settings,
+            "factions": state.factions,
+            "items": state.items,
+            "timeline_events": state.timeline_events,
+        }
+        bucket = mapping.get(category, {})
+        if isinstance(bucket, dict):
+            return bucket
+        if category == "characters":
+            state.characters = {}
+            return state.characters
+        if category == "world_settings":
+            state.world_settings = {}
+            return state.world_settings
+        if category == "factions":
+            state.factions = {}
+            return state.factions
+        if category == "items":
+            state.items = {}
+            return state.items
+        state.timeline_events = {}
+        return state.timeline_events
+
+    def _entity_name_of(row: dict[str, Any], default_name: str) -> str:
+        value = str(row.get("name", "")).strip()
+        return value if value else default_name
+
+    def _normalize_legacy_entity_data() -> None:
+        if isinstance(state.characters, list):
+            legacy = state.characters
+            state.characters = {}
+            for idx, row in enumerate(legacy):
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("id") or uuid4().hex)
+                state.characters[key] = {
+                    "name": str(row.get("entity_id") or f"角色{idx + 1}"),
+                    "environment": str(row.get("environment", "")),
+                    "behavior": str(row.get("behavior", "")),
+                    "capability": str(row.get("capability", "")),
+                    "values": str(row.get("values", "")),
+                    "identity": str(row.get("identity", "")),
+                    "vision": str(row.get("vision", "")),
+                }
+        if isinstance(state.world_settings, list):
+            legacy = state.world_settings
+            state.world_settings = {}
+            for idx, row in enumerate(legacy):
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("id") or uuid4().hex)
+                state.world_settings[key] = {
+                    "name": str(row.get("region_name") or f"世界设定{idx + 1}"),
+                    "background_origin": str(row.get("region_name", "")),
+                    "core_rules": str(row.get("hidden_rules", "")),
+                    "related_figures": str(row.get("power_structure", "")),
+                    "current_status": str(row.get("tech_level", "")),
+                }
+        if isinstance(state.items, list):
+            legacy = state.items
+            state.items = {}
+            for idx, row in enumerate(legacy):
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("id") or uuid4().hex)
+                state.items[key] = {
+                    "name": str(row.get("item_name") or f"资产{idx + 1}"),
+                    "acquisition_source": str(row.get("origin", "")),
+                    "core_function": str(row.get("item_function", "")),
+                    "usage_limits_cost": str(row.get("hidden_power", "")),
+                    "strategic_meaning": str(row.get("story_hook", "")),
+                }
+        if not isinstance(state.factions, dict):
+            state.factions = {}
+        if not isinstance(state.timeline_events, dict):
+            state.timeline_events = {}
+
+    def render_entity_list() -> None:
+        category = _get_current_entity_category()
+        bucket = _entity_bucket(category)
+        entity_list_view.controls.clear()
+        selected_key = selected_entity_ref["key"]
+        if not bucket:
+            selected_entity_ref["key"] = None
+            entity_list_view.controls.append(ft.Text("暂无档案。", color=ft.Colors.BLUE_GREY_300))
+            return
+        if selected_key not in bucket:
+            selected_entity_ref["key"] = None
+            selected_key = None
+        schema = entity_schema[category]
+        for key, row in bucket.items():
+            name = _entity_name_of(row, schema["default_name"])
+            is_selected = selected_key == key
+            entity_list_view.controls.append(
+                ft.Container(
+                    bgcolor=ft.Colors.BLUE_GREY_800 if is_selected else ft.Colors.BLUE_GREY_900,
+                    border_radius=8,
+                    content=ft.TextButton(
+                        name,
+                        on_click=lambda event, entity_key=key: on_select_entity(event, entity_key),
+                        style=ft.ButtonStyle(color=ft.Colors.WHITE),
+                    ),
+                )
+            )
+
+    def render_entity_detail_panel() -> None:
+        category = _get_current_entity_category()
+        bucket = _entity_bucket(category)
+        selected_key = selected_entity_ref["key"]
+        if selected_key is None or selected_key not in bucket:
+            entity_detail_box.content = ft.Container(
+                expand=True,
+                alignment=ft.Alignment(0, 0),
+                content=ft.Text("请在左侧选择或新建实体", color=ft.Colors.BLUE_GREY_300),
+            )
+            return
+        schema = entity_schema[category]
+        row = bucket[selected_key]
+        entity_name_input.value = _entity_name_of(row, schema["default_name"])
+        entity_form_field_refs.clear()
+        field_controls: list[ft.Control] = [entity_name_input]
+        for field_key, field_label in schema["fields"]:
+            field = ft.TextField(label=field_label, multiline=True, min_lines=4, value=str(row.get(field_key, "")))
+            entity_form_field_refs[field_key] = field
+            field_controls.append(field)
+        field_controls.append(
+            ft.Row(
+                controls=[
+                    ft.Button(
+                        "🗑️ 删除该档案",
+                        on_click=on_delete_selected_entity,
+                        style=ft.ButtonStyle(bgcolor=ft.Colors.RED_400, color=ft.Colors.WHITE),
+                    ),
+                    ft.Button(
+                        "💾 保存修改",
+                        on_click=on_save_selected_entity,
+                        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
+                    ),
+                ],
+                spacing=10,
+            )
+        )
+        entity_detail_box.content = ft.Column(
+            controls=field_controls,
+            spacing=12,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
         )
 
-    def render_character_cards() -> None:
-        character_cards_box.controls.clear()
-        if state.characters:
-            character_cards_box.controls.extend(build_character_tile(row, idx) for idx, row in enumerate(state.characters))
-        else:
-            character_cards_box.controls.append(ft.Text("暂无人物卡数据。"))
-
-    def render_world_cards() -> None:
-        world_cards_box.controls.clear()
-        if state.world_settings:
-            world_cards_box.controls.extend(build_world_tile(row, idx) for idx, row in enumerate(state.world_settings))
-        else:
-            world_cards_box.controls.append(ft.Text("暂无世界卡数据。"))
-
-    def render_item_cards() -> None:
-        item_cards_box.controls.clear()
-        if state.items:
-            item_cards_box.controls.extend(build_item_tile(row, idx) for idx, row in enumerate(state.items))
-        else:
-            item_cards_box.controls.append(ft.Text("暂无剧情锚点数据。"))
+    def on_select_entity(_: ft.ControlEvent, entity_key: str) -> None:
+        selected_entity_ref["key"] = entity_key
+        render_entity_list()
+        render_entity_detail_panel()
+        page.update()
 
     def refresh_entity_view(_: ft.ControlEvent | None = None) -> None:
-        render_character_cards()
-        render_world_cards()
-        render_item_cards()
+        _normalize_legacy_entity_data()
+        render_entity_list()
+        render_entity_detail_panel()
         page.update()
 
-    def on_add_character_card(_: ft.ControlEvent) -> None:
-        state.characters.append(
-            {
-                "id": len(state.characters) + 1,
-                "entity_id": f"角色{len(state.characters) + 1}",
-                "version_chapter": 1,
-                "environment": "",
-                "behavior": "",
-                "capability": "",
-                "values": "",
-                "identity": "",
-                "vision": "",
-                "update_reason": "手动新建",
-            }
-        )
+    def on_entity_category_change(_: ft.ControlEvent) -> None:
+        selected_entity_ref["key"] = None
+        render_entity_list()
+        render_entity_detail_panel()
+        page.update()
+
+    def on_add_entity(_: ft.ControlEvent) -> None:
+        category = _get_current_entity_category()
+        schema = entity_schema[category]
+        bucket = _entity_bucket(category)
+        key = uuid4().hex
+        payload: dict[str, Any] = {"name": schema["default_name"]}
+        for field_key, _ in schema["fields"]:
+            payload[field_key] = ""
+        bucket[key] = payload
+        selected_entity_ref["key"] = key
         save_full_archive()
-        render_character_cards()
+        render_entity_list()
+        render_entity_detail_panel()
         page.update()
 
-    def on_add_world_card(_: ft.ControlEvent) -> None:
-        state.world_settings.append(
-            {
-                "id": len(state.world_settings) + 1,
-                "region_name": f"区域{len(state.world_settings) + 1}",
-                "tech_level": "",
-                "power_structure": "",
-                "hidden_rules": "",
-            }
-        )
+    def on_save_selected_entity(_: ft.ControlEvent) -> None:
+        category = _get_current_entity_category()
+        bucket = _entity_bucket(category)
+        selected_key = selected_entity_ref["key"]
+        if selected_key is None or selected_key not in bucket:
+            show_info_dialog("请先在左侧选择实体。")
+            return
+        schema = entity_schema[category]
+        updated: dict[str, Any] = {"name": (entity_name_input.value or schema["default_name"]).strip()}
+        for field_key, _ in schema["fields"]:
+            field = entity_form_field_refs.get(field_key)
+            updated[field_key] = (field.value if field else "") or ""
+        bucket[selected_key] = updated
         save_full_archive()
-        render_world_cards()
+        render_entity_list()
+        render_entity_detail_panel()
+        set_status("档案已保存。")
         page.update()
 
-    def on_ai_generate_character_card(_: ft.ControlEvent) -> None:
-        if state.book_outline is None:
-            show_info_dialog("请先完成或加载全书总纲")
+    def on_delete_selected_entity(_: ft.ControlEvent) -> None:
+        category = _get_current_entity_category()
+        bucket = _entity_bucket(category)
+        selected_key = selected_entity_ref["key"]
+        if selected_key is None or selected_key not in bucket:
+            show_info_dialog("请先在左侧选择实体。")
             return
-        show_loading(page, with_rules_hint("AI 正在生成人物卡..."))
-        try:
-            traits = derive_initial_traits(
-                user_idea=state.book_outline.logline,
-                book_outline=state.book_outline,
-                concept_proposal=state.concept_proposal,
-                model=state.models["supervisor"],
-            )
-            state.characters.append(
-                {
-                    "id": len(state.characters) + 1,
-                    "entity_id": f"AI角色{len(state.characters) + 1}",
-                    "version_chapter": 1,
-                    "environment": traits.environment,
-                    "behavior": traits.behavior,
-                    "capability": traits.capability,
-                    "values": traits.values,
-                    "identity": traits.identity,
-                    "vision": traits.vision,
-                    "update_reason": "AI生成",
-                }
-            )
-            save_full_archive()
-            render_character_cards()
-            page.update()
-        except Exception as exc:
-            show_info_dialog(f"AI 生成人物卡失败：{exc}")
-        finally:
-            hide_loading(page)
 
-    def on_ai_generate_world_card(_: ft.ControlEvent) -> None:
-        if state.book_outline is None:
-            show_info_dialog("请先完成或加载全书总纲")
-            return
-        show_loading(page, with_rules_hint("AI 正在生成世界卡..."))
-        try:
-            result = brainstorm_ideas(
-                current_idea=f"请基于以下总纲生成一张世界卡：{state.book_outline.logline}",
-                chat_history=state.chat_history,
-                model=state.models["supervisor"],
-            )
-            summary = str(result.get("assistant_reply", "")).strip()
-            state.world_settings.append(
-                {
-                    "id": len(state.world_settings) + 1,
-                    "region_name": f"AI区域{len(state.world_settings) + 1}",
-                    "tech_level": "由AI生成",
-                    "power_structure": summary or "待补充",
-                    "hidden_rules": summary or "待补充",
-                }
-            )
-            save_full_archive()
-            render_world_cards()
+        def on_cancel(_: ft.ControlEvent) -> None:
+            dialog.open = False
             page.update()
-        except Exception as exc:
-            show_info_dialog(f"AI 生成世界卡失败：{exc}")
-        finally:
-            hide_loading(page)
+
+        def on_confirm(_: ft.ControlEvent) -> None:
+            bucket.pop(selected_key, None)
+            selected_entity_ref["key"] = None
+            dialog.open = False
+            save_full_archive()
+            render_entity_list()
+            render_entity_detail_panel()
+            page.update()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("确认删除"),
+            content=ft.Text("删除后不可恢复，是否继续？"),
+            actions=[
+                ft.TextButton("取消", on_click=on_cancel),
+                ft.TextButton("确认删除", on_click=on_confirm),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
+
+    def on_ai_generate_entity(_: ft.ControlEvent) -> None:
+        category = _get_current_entity_category()
+        schema = entity_schema[category]
+        requirement_input = ft.TextField(
+            label="生成要求",
+            hint_text="例如：生成一个 2003 年的 SP 业务皮包公司",
+            multiline=True,
+            min_lines=2,
+            max_lines=4,
+            autofocus=True,
+        )
+
+        def on_cancel(_: ft.ControlEvent) -> None:
+            dialog.open = False
+            page.update()
+
+        def on_confirm(_: ft.ControlEvent) -> None:
+            requirement = (requirement_input.value or "").strip()
+            if not requirement:
+                show_info_dialog("请输入要求后再生成。")
+                return
+            dialog.open = False
+            page.update()
+            show_loading(page, with_rules_hint("AI 正在定向生成档案..."))
+            try:
+                fields = [field_key for field_key, _ in schema["fields"]]
+                response = generate_text(
+                    system_prompt=(
+                        "你是设定数据库生成助手。请仅输出 JSON 对象，不要输出任何解释。"
+                        "必须包含 name 字段与要求的字段。"
+                    ),
+                    user_prompt=(
+                        f"分类：{schema['label']}\n"
+                        f"用户要求：{requirement}\n"
+                        f"必须输出字段：name, {', '.join(fields)}\n"
+                        "输出格式：严格 JSON 对象。"
+                    ),
+                    model=state.models["supervisor"],
+                    temperature=0.7,
+                )
+                parsed = json.loads(response)
+                if not isinstance(parsed, dict):
+                    raise ValueError("AI 返回不是 JSON 对象")
+                payload: dict[str, Any] = {"name": str(parsed.get("name") or schema["default_name"])}
+                for field_key, _ in schema["fields"]:
+                    payload[field_key] = str(parsed.get(field_key, ""))
+                bucket = _entity_bucket(category)
+                key = uuid4().hex
+                bucket[key] = payload
+                selected_entity_ref["key"] = key
+                save_full_archive()
+                render_entity_list()
+                render_entity_detail_panel()
+                page.update()
+            except Exception as exc:
+                show_info_dialog(f"AI 定向生成失败：{exc}")
+            finally:
+                hide_loading(page)
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("🤖 AI 定向生成"),
+            content=requirement_input,
+            actions=[
+                ft.TextButton("取消", on_click=on_cancel),
+                ft.TextButton("生成", on_click=on_confirm),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
+
+    def render_character_cards() -> None:
+        render_entity_list()
+
+    entity_category_picker.on_change = on_entity_category_change
 
     def on_generate_book_outline_only(_: ft.ControlEvent) -> None:
         idea = ""
@@ -2264,6 +2579,7 @@ def main(page: ft.Page) -> None:
         page.update()
 
     def on_run_pipeline(_: ft.ControlEvent) -> None:
+        started_at = perf_counter()
         try:
             chapter_num = int(chapter_num_input.value or "1")
         except ValueError:
@@ -2281,9 +2597,18 @@ def main(page: ft.Page) -> None:
         pipeline_progress.visible = True
         pipeline_status.value = "状态：正在加载挂载法则..."
         set_status("正在加载挂载法则...")
+        logger.info(
+            "ui.pipeline.start chapter=%s idea_chars=%s mounted_rules=%s models=%s/%s/%s",
+            chapter_num,
+            len(idea),
+            len(state.mounted_rules),
+            state.models["planner"],
+            state.models["drafter"],
+            state.models["checker"],
+        )
         show_loading(page, with_rules_hint("正在执行章节流水线..."))
         pipeline_output.value = ""
-        pipeline_stream.controls = []
+        update_workshop_word_count("")
         page.update()
         try:
             pipeline_status.value = "状态：正在执行章节流水线..."
@@ -2301,11 +2626,17 @@ def main(page: ft.Page) -> None:
                 checker_model=state.models["checker"],
             )
             pipeline_output.value = final_text
-            pipeline_stream.controls = [ft.Text(line) for line in final_text.splitlines()]
+            update_workshop_word_count(final_text)
             request_focus(pipeline_output)
-            current_volume = state.selected_volume_num if state.selected_volume_num is not None else 0
+            selected_volume = _get_selected_workshop_volume()
+            current_volume = selected_volume if selected_volume is not None else (
+                state.selected_volume_num if state.selected_volume_num is not None else 1
+            )
             text_key = f"{current_volume}:{chapter_num}"
             save_chapter_text(text_key, final_text)
+            if current_volume > 0:
+                workshop_volume_picker.value = str(current_volume)
+            chapter_picker.value = str(chapter_num)
             state.chapter_state = {
                 "chapter_num": chapter_num,
                 "chapter_idea": idea,
@@ -2315,9 +2646,21 @@ def main(page: ft.Page) -> None:
             save_full_archive()
             pipeline_status.value = "状态：生成完成。"
             set_status("章节生成完成。")
+            logger.info(
+                "ui.pipeline.done chapter=%s duration_ms=%s output_chars=%s",
+                chapter_num,
+                int((perf_counter() - started_at) * 1000),
+                len(final_text),
+            )
         except Exception as exc:
             pipeline_status.value = f"状态：流水线失败 - {exc}"
             set_status("流水线执行失败。")
+            logger.exception(
+                "ui.pipeline.error chapter=%s duration_ms=%s error=%s",
+                chapter_num_input.value or "",
+                int((perf_counter() - started_at) * 1000),
+                exc,
+            )
         finally:
             run_pipeline_btn.disabled = False
             run_pipeline_btn.text = "🔥 启动流水线"
@@ -2340,10 +2683,10 @@ def main(page: ft.Page) -> None:
         os.environ["DEEPSEEK_API_KEY"] = api_key_input.value or ""
         _save_model_config(state.model_entries, state.agent_aliases)
         state.models = _resolve_agent_models(state.model_entries, state.agent_aliases)
-        settings_status.value = "状态：API、模型列表与映射已保存。"
+        settings_status.value = "状态：.env、模型列表与映射已保存。"
         set_status("配置已持久化到本地。")
         save_settings_btn.disabled = False
-        save_settings_btn.text = "保存 API 与模型"
+        save_settings_btn.text = "保存 .env 与模型"
         save_settings_ring.visible = False
         page.update()
 
@@ -2374,29 +2717,24 @@ def main(page: ft.Page) -> None:
         style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
         height=52,
     )
+    save_chapter_btn = ft.Button(
+        "💾 保存本章",
+        on_click=on_save_current_chapter,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+    )
     refresh_entities_btn = ft.OutlinedButton("刷新档案", on_click=refresh_entity_view)
     add_character_btn = ft.Button(
-        "➕ 新建人物卡",
-        on_click=on_add_character_card,
+        "➕ 手动新建",
+        on_click=on_add_entity,
         style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
     )
     ai_character_btn = ft.Button(
-        "🤖 AI 生成人物卡",
-        on_click=on_ai_generate_character_card,
-        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
-    )
-    add_world_btn = ft.Button(
-        "➕ 新建世界卡",
-        on_click=on_add_world_card,
-        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
-    )
-    ai_world_btn = ft.Button(
-        "🤖 AI 生成世界卡",
-        on_click=on_ai_generate_world_card,
+        "🤖 AI 定向生成",
+        on_click=on_ai_generate_entity,
         style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
     )
     save_settings_btn = ft.Button(
-        "保存 API 与模型",
+        "保存 .env 与模型",
         on_click=on_save_settings,
         style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
     )
@@ -2521,6 +2859,10 @@ def main(page: ft.Page) -> None:
         spacing=8,
     )
     pipeline_run_row = ft.Row([run_pipeline_btn, run_pipeline_ring], spacing=8)
+    workshop_footer_row = ft.Row(
+        controls=[save_chapter_btn, ft.Container(expand=True), workshop_word_count],
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+    )
     settings_save_row = ft.Row([save_settings_btn, save_settings_ring], spacing=8)
     spark_row.controls = [
         ft.Button(
@@ -2561,8 +2903,7 @@ def main(page: ft.Page) -> None:
             page.update()
         if selected_idx == 1:
             render_character_cards()
-            render_world_cards()
-            render_item_cards()
+            render_entity_detail_panel()
             page.update()
 
     def on_home_tabs_change(event: ft.ControlEvent) -> None:
@@ -2655,9 +2996,11 @@ def main(page: ft.Page) -> None:
             state.selected_volume_num = None
             state.volume_outline = None
             state.chapter_outline = None
-            state.characters = []
-            state.world_settings = []
-            state.items = []
+            state.characters = {}
+            state.world_settings = {}
+            state.factions = {}
+            state.items = {}
+            state.timeline_events = {}
             state.mounted_rules = []
             state.active_traits = load_default_traits()
             state.current_stage = STAGE_CONCEPT
@@ -2839,64 +3182,47 @@ def main(page: ft.Page) -> None:
 
     entities_content = ft.Container(
             padding=12,
-            content=ft.Column(
+            content=ft.Row(
                 controls=[
-                    ft.Row(
-                        [
-                            ft.Text("White-box Entities", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                            refresh_entities_btn,
-                        ]
+                    ft.Container(
+                        width=300,
+                        content=ft.Column(
+                            controls=[
+                                entity_category_picker,
+                                ft.Row([add_character_btn, ai_character_btn], wrap=True),
+                                entity_list_view,
+                            ],
+                            spacing=10,
+                            expand=True,
+                        ),
                     ),
-                    ft.Text("当前生效人设", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                    active_environment_input,
-                    active_behavior_input,
-                    active_capability_input,
-                    active_values_input,
-                    active_identity_input,
-                    active_vision_input,
-                    save_active_traits_btn,
-                    ft.Row([add_character_btn, ai_character_btn], wrap=True),
-                    ft.Text("人物卡", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                    character_cards_box,
-                    ft.Row([add_world_btn, ai_world_btn], wrap=True),
-                    ft.Text("世界卡", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                    world_cards_box,
-                    ft.Text("剧情锚点/金手指", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                    item_cards_box,
+                    ft.VerticalDivider(),
+                    ft.Container(
+                        expand=True,
+                        padding=30,
+                        content=entity_detail_box,
+                    ),
                 ],
-                spacing=12,
                 expand=True,
             ),
         )
 
     pipeline_content = ft.Container(
             padding=12,
-            content=ft.Row(
+            content=ft.Column(
                 controls=[
-                    ft.Container(
-                        expand=3,
-                        content=ft.Column(
-                            controls=[
-                                ft.Text("The Pipeline", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                                chapter_picker,
-                                chapter_num_input,
-                                chapter_idea_input,
-                                pipeline_run_row,
-                            ],
-                            spacing=12,
-                        ),
-                    ),
-                    ft.VerticalDivider(),
-                    ft.Container(
-                        expand=7,
-                        content=ft.Column(
-                            controls=[pipeline_progress, pipeline_status, pipeline_stream],
-                            spacing=12,
-                            expand=True,
-                        ),
-                    ),
+                    ft.Text("Writing Workshop", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                    ft.Row([workshop_volume_picker, chapter_picker], spacing=10),
+                    chapter_num_input,
+                    chapter_idea_input,
+                    pipeline_run_row,
+                    pipeline_progress,
+                    pipeline_status,
+                    ft.Container(content=pipeline_output, expand=True, bgcolor=ft.Colors.with_opacity(0.08, ft.Colors.BLUE_GREY_900)),
+                    workshop_footer_row,
                 ],
                 expand=True,
+                spacing=10,
             ),
         )
 
@@ -2928,6 +3254,20 @@ def main(page: ft.Page) -> None:
                 ft.Text("⚖️ 法则炼金炉", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
                 rule_source_input,
                 ft.Row([rule_category_dropdown, element_target_input], wrap=True),
+                rule_group_input,
+                ft.Row(
+                    controls=[
+                        ft.Text("建议分组：", color=ft.Colors.BLUE_GREY_300),
+                        *[
+                            ft.OutlinedButton(
+                                option,
+                                on_click=lambda event, name=option: on_select_rule_group(event, name),
+                            )
+                            for option in rule_group_default_options
+                        ],
+                    ],
+                    wrap=True,
+                ),
                 ft.Row(
                     [
                         extract_rule_btn,

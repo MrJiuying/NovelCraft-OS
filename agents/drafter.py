@@ -1,6 +1,11 @@
+import logging
+from time import perf_counter
+
 from core.config import SMART_MODEL
 from core.llm_client import generate_text
 from core.schemas import ChapterBeatTemplate, NLPBaseTraits, WritingRule
+
+logger = logging.getLogger(__name__)
 
 
 def draft_chapter(
@@ -11,6 +16,14 @@ def draft_chapter(
     checker_feedback: str = "",
     model: str = SMART_MODEL,
 ) -> str:
+    start = perf_counter()
+    logger.info(
+        "drafter.start chapter=%s rules=%s model=%s feedback_chars=%s",
+        chapter_number,
+        len(mounted_rules or []),
+        model,
+        len(checker_feedback),
+    )
     style_guidelines: list[str] = []
     negative_constraints: list[str] = []
     for rule in mounted_rules or []:
@@ -46,9 +59,17 @@ def draft_chapter(
         f"裁判反馈：{checker_feedback or '无'}"
     )
 
-    return generate_text(
+    text = generate_text(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         model=model,
         temperature=0.8,
     )
+    duration_ms = int((perf_counter() - start) * 1000)
+    logger.info(
+        "drafter.done chapter=%s duration_ms=%s output_chars=%s",
+        chapter_number,
+        duration_ms,
+        len(text),
+    )
+    return text

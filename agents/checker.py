@@ -1,8 +1,13 @@
+import logging
+from time import perf_counter
+
 from pydantic import BaseModel, Field
 
 from core.config import FAST_MODEL
 from core.llm_client import generate_structured_data
 from core.schemas import NLPBaseTraits
+
+logger = logging.getLogger(__name__)
 
 
 class CheckResult(BaseModel):
@@ -22,6 +27,13 @@ def check_consistency(
     chapter_idea: str,
     model: str = FAST_MODEL,
 ) -> CheckResult:
+    start = perf_counter()
+    logger.info(
+        "checker.start model=%s draft_chars=%s idea_chars=%s",
+        model,
+        len(draft_text),
+        len(chapter_idea),
+    )
     system_prompt = (
         "你是网文一致性裁判。请严格检查章节正文是否符合角色设定与本章脑洞。"
         "若不符合，必须指出最关键的问题并给出可执行修改建议。"
@@ -34,10 +46,19 @@ def check_consistency(
         "正文草稿：\n"
         f"{draft_text}"
     )
-    return generate_structured_data(
+    result = generate_structured_data(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         response_model=CheckResult,
         model=model,
         temperature=0.0,
     )
+    duration_ms = int((perf_counter() - start) * 1000)
+    logger.info(
+        "checker.done model=%s duration_ms=%s is_passed=%s feedback_chars=%s",
+        model,
+        duration_ms,
+        result.is_passed,
+        len(result.feedback or ""),
+    )
+    return result

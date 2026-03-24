@@ -1,6 +1,11 @@
+import logging
+from time import perf_counter
+
 from core.config import SMART_MODEL
 from core.llm_client import generate_structured_data
 from core.schemas import ChapterBeatTemplate, NLPBaseTraits, WritingRule
+
+logger = logging.getLogger(__name__)
 
 
 class BeatPlannerAgent:
@@ -15,10 +20,17 @@ class BeatPlannerAgent:
         mounted_rules: list[WritingRule] | None = None,
         model: str = SMART_MODEL,
     ) -> ChapterBeatTemplate:
+        start = perf_counter()
         pacing_rules = []
         for rule in mounted_rules or []:
             for instruction in rule.positive_instructions:
                 pacing_rules.append(str(instruction))
+        logger.info(
+            "planner.start chapter=%s rules=%s model=%s",
+            chapter_number,
+            len(mounted_rules or []),
+            model,
+        )
         pacing_text = "\n".join(f"{index + 1}. {rule}" for index, rule in enumerate(pacing_rules))
         traits_text = character_traits.model_dump_json(indent=2)
 
@@ -51,9 +63,20 @@ class BeatPlannerAgent:
             model=model,
             temperature=0.7,
         )
-
+        duration_ms = int((perf_counter() - start) * 1000)
         if result.chapter_number != chapter_number:
+            logger.info(
+                "planner.corrected chapter=%s corrected_to=%s duration_ms=%s",
+                chapter_number,
+                chapter_number,
+                duration_ms,
+            )
             return result.model_copy(update={"chapter_number": chapter_number})
+        logger.info(
+            "planner.done chapter=%s duration_ms=%s",
+            chapter_number,
+            duration_ms,
+        )
         return result
 
 
