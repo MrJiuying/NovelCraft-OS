@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 
 from core.config import SMART_MODEL
 from core.llm_client import generate_structured_data
-from core.schemas import BookOutline, ChapterOutlineList, ConceptProposal, NLPBaseTraits, VolumeOutline
+from core.schemas import BookOutline, ChapterOutlineList, ConceptProposal, NLPBaseTraits, VolumeOutline, WritingRule
 
 
 class BrainstormResult(BaseModel):
@@ -18,6 +18,21 @@ class BrainstormResult(BaseModel):
         ...,
         description="当前阶段的策划案草稿，会随着对话逐步收敛。",
     )
+
+
+def _build_mounted_rules_block(mounted_rules: list[WritingRule] | None) -> str:
+    if not mounted_rules:
+        return ""
+    chunks: list[str] = ["### 必须严格遵守的动态写作挂载法则 ###"]
+    for rule in mounted_rules:
+        pos = "\n".join(f"- {item}" for item in rule.positive_instructions)
+        neg = "\n".join(f"- {item}" for item in rule.negative_constraints)
+        chunks.append(
+            f"【{rule.category}｜{rule.rule_name}｜适用阶段:{rule.applicable_stage}】\n"
+            f"必须执行：\n{pos}\n"
+            f"绝对禁止：\n{neg}"
+        )
+    return "\n\n".join(chunks)
 
 
 def brainstorm_ideas(
@@ -67,6 +82,7 @@ def generate_book_outline(
     user_idea: str,
     model: str = SMART_MODEL,
     concept_proposal: ConceptProposal | None = None,
+    mounted_rules: list[WritingRule] | None = None,
 ) -> BookOutline:
     system_prompt = (
         "你是网文白金作家兼资深主编。你的目标是把用户脑洞推演成可商业连载的重度追更型全书总纲。"
@@ -80,6 +96,9 @@ def generate_book_outline(
         "4) 总数对应：若全书预计300万字，则大结局应在第1500章左右。"
         "5) pacing_design 输出时，所有关键节点必须标注“（约X万字，第Y章）”，且 X 与 Y 必须满足 1万字=5章（即 1:50）。"
     )
+    rules_block = _build_mounted_rules_block(mounted_rules)
+    if rules_block:
+        system_prompt = f"{system_prompt}\n\n{rules_block}"
     proposal_text = (
         concept_proposal.model_dump_json(indent=2) if concept_proposal else "未提供"
     )
@@ -101,6 +120,7 @@ def generate_volume_outline(
     book_outline: BookOutline,
     target_volume_num: int,
     model: str = SMART_MODEL,
+    mounted_rules: list[WritingRule] | None = None,
 ) -> VolumeOutline:
     system_prompt = (
         "你是网文白金主编，负责制定单卷连载作战方案。"
@@ -114,6 +134,9 @@ def generate_volume_outline(
         "“支线A：网吧冲突（第1-15章，约3万字）”。"
         "4) 章节区间与字数必须满足 1:50 的万字-章数关系，禁止数学冲突。"
     )
+    rules_block = _build_mounted_rules_block(mounted_rules)
+    if rules_block:
+        system_prompt = f"{system_prompt}\n\n{rules_block}"
     user_prompt = (
         f"目标卷号：{target_volume_num}\n"
         "全书总纲(JSON)：\n"
@@ -136,12 +159,16 @@ def generate_chapter_ideas(
     volume_outline: VolumeOutline,
     chapter_count: int,
     model: str = SMART_MODEL,
+    mounted_rules: list[WritingRule] | None = None,
 ) -> ChapterOutlineList:
     system_prompt = (
         "你是网文章节连载编排师。请根据分卷核心冲突，把剧情拆解为连续可追更的单章核心事件。"
         "章节事件必须递进升级、前后因果紧密，并服务于本卷冲突闭环。"
         "输出必须严格遵守 ChapterOutlineList 结构。"
     )
+    rules_block = _build_mounted_rules_block(mounted_rules)
+    if rules_block:
+        system_prompt = f"{system_prompt}\n\n{rules_block}"
     user_prompt = (
         f"目标章节数：{chapter_count}\n"
         "分卷大纲(JSON)：\n"

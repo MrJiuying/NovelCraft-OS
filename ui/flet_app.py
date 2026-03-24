@@ -22,6 +22,7 @@ from agents.supervisor import (
     generate_chapter_ideas,
     generate_volume_outline,
 )
+from agents.quality_extractor import anatomize_fiction_snippet, distill_tutorial_to_rule
 from core.config import FAST_MODEL, SMART_MODEL
 from core.database import DB_PATH
 from core.database import init_character_traits_table
@@ -33,6 +34,7 @@ from core.schemas import (
     ConceptProposal,
     NLPBaseTraits,
     VolumeOutline,
+    WritingRule,
 )
 from workflow.graph import run_chapter_pipeline
 
@@ -43,6 +45,7 @@ STAGE_CHAPTERS = "CHAPTERS"
 
 class AppState:
     def __init__(self) -> None:
+        self.project_name: str = "未命名脑洞"
         self.active_traits: NLPBaseTraits | None = None
         self.concept_proposal: ConceptProposal | None = None
         self.book_outline: BookOutline | None = None
@@ -52,9 +55,15 @@ class AppState:
         self.volume_outline: VolumeOutline | None = None
         self.chapter_outline: ChapterOutlineList | None = None
         self.chapter_state: dict[str, Any] = {}
+        self.chapter_texts: dict[str, str] = {}
+        self.chapter_files: dict[str, str] = {}
         self.current_stage: str = STAGE_CONCEPT
         self.chat_history: list[dict[str, str]] = []
         self.quick_options: list[str] = []
+        self.characters: list[dict[str, Any]] = []
+        self.world_settings: list[dict[str, Any]] = []
+        self.items: list[dict[str, Any]] = []
+        self.mounted_rules: list[WritingRule] = []
         self.model_entries: list[dict[str, str]] = []
         self.agent_aliases: dict[str, str] = {}
         self.models = {
@@ -73,10 +82,6 @@ def _env_path() -> Path:
     return _project_root() / ".env"
 
 
-def _tomato_path() -> Path:
-    return _project_root() / "prompt_library" / "platforms" / "tomato.json"
-
-
 def _model_config_path() -> Path:
     return _project_root() / "model_manager.json"
 
@@ -87,6 +92,14 @@ def _data_dir() -> Path:
 
 def _chat_cache_path() -> Path:
     return _data_dir() / "chat_cache.json"
+
+
+def _projects_dir() -> Path:
+    return _data_dir() / "projects"
+
+
+def _rules_dir() -> Path:
+    return _data_dir() / "knowledge_base" / "rules"
 
 
 def _default_model_entries() -> list[dict[str, str]]:
@@ -330,6 +343,17 @@ def main(page: ft.Page) -> None:
         expand=True,
     )
     chapter_outline_box = ft.TextField(label="单章脑洞列表", multiline=True, min_lines=12, max_lines=18, visible=False, animate_opacity=200)
+    book_outline_context_box = ft.TextField(
+        label="全书总纲上下文（只读）",
+        multiline=True,
+        min_lines=8,
+        max_lines=14,
+        read_only=True,
+        border_color=ft.Colors.BLUE_700,
+        focused_border_color=ft.Colors.BLUE_300,
+        expand=True,
+    )
+    book_outline_mount_status = ft.Text("总纲挂载状态：未挂载", color=ft.Colors.RED_300)
     selected_volume_title = ft.Text("当前未选中分卷", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400)
     volume_cards_view = ft.ListView(expand=True, spacing=8, auto_scroll=True)
     chapter_cards_view = ft.ListView(expand=True, spacing=10, auto_scroll=True)
@@ -385,11 +409,6 @@ def main(page: ft.Page) -> None:
         min_lines=2,
         max_lines=4,
     )
-    pipeline_platform_dropdown = ft.Dropdown(
-        label="选择平台文风",
-        value="番茄小说",
-        options=[ft.dropdown.Option("番茄小说")],
-    )
     pipeline_output = ft.TextField(
         label="章节正文",
         multiline=True,
@@ -400,8 +419,34 @@ def main(page: ft.Page) -> None:
     pipeline_stream = ft.ListView(expand=True, auto_scroll=True, spacing=4)
     pipeline_progress = ft.ProgressBar(visible=False, color=ft.Colors.BLUE_400)
 
-    entity_panel = ft.Column(spacing=12, expand=True, scroll=ft.ScrollMode.AUTO)
+    character_cards_box = ft.Column(spacing=10)
+    world_cards_box = ft.Column(spacing=10)
+    item_cards_box = ft.Column(spacing=10)
+    tactical_rules_box = ft.Column(spacing=6)
+    rule_positive_box = ft.Column(spacing=6)
+    rule_negative_box = ft.Column(spacing=6)
     model_manager_column = ft.Column(spacing=8)
+    rule_source_input = ft.TextField(
+        label="粘贴爆款神级切片 / 官方干货教程 / 时代背景资料",
+        multiline=True,
+        min_lines=8,
+        max_lines=14,
+    )
+    rule_category_dropdown = ft.Dropdown(
+        label="选择提取/蒸馏的法则分类",
+        value="Elements",
+        options=[
+            ft.dropdown.Option("Elements", "要素解剖"),
+            ft.dropdown.Option("Theories", "理论蒸馏"),
+            ft.dropdown.Option("Taboos", "避毒红线"),
+            ft.dropdown.Option("Formatting", "排版语感"),
+            ft.dropdown.Option("Lore", "时代考据"),
+            ft.dropdown.Option("Tropes", "专属桥段"),
+        ],
+    )
+    element_target_input = ft.TextField(label="要素解剖目标（仅 Elements 使用）", value="人物")
+    rule_name_preview = ft.Text("法则名称：-", color=ft.Colors.BLUE_300)
+    save_rule_btn = ft.Button("💾 保存到本地知识库", disabled=True)
 
     env_map = _load_env_map()
     loaded_entries, loaded_aliases = _load_model_config()
@@ -419,24 +464,297 @@ def main(page: ft.Page) -> None:
     drafter_mapping_dropdown = ft.Dropdown(label="Drafter 映射")
     checker_mapping_dropdown = ft.Dropdown(label="Checker 映射")
     settings_status = ft.Text("状态：等待保存...")
-    tomato_json_box = ft.TextField(label="tomato.json 预览", multiline=True, min_lines=10, max_lines=14)
-    pacing_rules_box = ft.Column(spacing=8)
-    banned_words_wrap = ft.Row(wrap=True, spacing=8)
-    banned_word_input = ft.TextField(label="新增违禁词")
-
-    tomato_data: dict[str, Any] = {}
+    local_rules_cache: list[WritingRule] = []
+    latest_rule_ref: dict[str, WritingRule | None] = {"rule": None}
     stage_jump_ref: dict[str, ft.Dropdown | None] = {"dropdown": None}
     stage_nav_ref: dict[str, ft.Button | None] = {"concept": None, "outline": None, "chapters": None}
     archive_filter_ref: dict[str, ft.Dropdown | None] = {"dropdown": None}
     archive_option_map: dict[str, str] = {}
+    loading_text = ft.Text("正在处理...", color=ft.Colors.BLUE_300)
+    loading_dialog = ft.AlertDialog(
+        modal=True,
+        content=ft.Row(
+            controls=[ft.ProgressRing(width=22, height=22, color=ft.Colors.BLUE_400), loading_text],
+            spacing=12,
+            tight=True,
+        ),
+    )
 
     def set_status(message: str) -> None:
         status_label.value = f"系统状态：{message}"
 
+    def mounted_rules_suffix() -> str:
+        count = len(state.mounted_rules)
+        return f"（已挂载 {count} 条战术法则）" if count > 0 else ""
+
+    def with_rules_hint(message: str) -> str:
+        suffix = mounted_rules_suffix()
+        return f"{message}{suffix}" if suffix else message
+
+    def show_loading(current_page: ft.Page, message: str = "正在处理...") -> None:
+        loading_text.value = message
+        if loading_dialog not in current_page.overlay:
+            current_page.overlay.append(loading_dialog)
+        loading_dialog.open = True
+        current_page.update()
+
+    def hide_loading(current_page: ft.Page) -> None:
+        loading_dialog.open = False
+        current_page.update()
+
+    def show_info_dialog(message: str, title: str = "提示") -> None:
+        def on_close_dialog(_: ft.ControlEvent) -> None:
+            dialog.open = False
+            page.update()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(title),
+            content=ft.Text(message),
+            actions=[ft.TextButton("知道了", on_click=on_close_dialog)],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
+
+    def rule_category_label(category: str) -> str:
+        mapping = {
+            "Elements": "要素解剖",
+            "Theories": "理论蒸馏",
+            "Taboos": "避毒红线",
+            "Formatting": "排版语感",
+            "Lore": "时代考据",
+            "Tropes": "专属桥段",
+        }
+        return mapping.get(category, category)
+
+    def render_rule_result(rule: WritingRule | None) -> None:
+        rule_positive_box.controls.clear()
+        rule_negative_box.controls.clear()
+        if rule is None:
+            rule_name_preview.value = "法则名称：-"
+            save_rule_btn.disabled = True
+            return
+        rule_name_preview.value = f"法则名称：{rule.rule_name}（{rule_category_label(rule.category)}）"
+        rule_positive_box.controls.extend(ft.Text(f"✅ {item}", color=ft.Colors.GREEN_300) for item in rule.positive_instructions)
+        rule_negative_box.controls.extend(ft.Text(f"⛔ {item}", color=ft.Colors.RED_300) for item in rule.negative_constraints)
+        save_rule_btn.disabled = False
+
+    def refresh_tactical_backpack() -> None:
+        tactical_rules_box.controls.clear()
+        mounted_ids = {item.rule_id for item in state.mounted_rules}
+        for rule in local_rules_cache:
+            def on_toggle(event: ft.ControlEvent, item: WritingRule = rule) -> None:
+                checked = bool(event.control.value)
+                existing = {entry.rule_id: entry for entry in state.mounted_rules}
+                if checked:
+                    existing[item.rule_id] = item
+                elif item.rule_id in existing:
+                    existing.pop(item.rule_id)
+                state.mounted_rules = list(existing.values())
+                save_full_archive()
+                set_status(f"战术背包已更新，共挂载 {len(state.mounted_rules)} 条法则。")
+                page.update()
+
+            tactical_rules_box.controls.append(
+                ft.Checkbox(
+                    value=rule.rule_id in mounted_ids,
+                    label=f"[{rule_category_label(rule.category)}] {rule.rule_name}（{rule.applicable_stage}）",
+                    on_change=on_toggle,
+                )
+            )
+        if not tactical_rules_box.controls:
+            tactical_rules_box.controls.append(ft.Text("暂无法则，请先在法则炼金炉中提炼并保存。"))
+
+    def reload_local_rules() -> None:
+        nonlocal local_rules_cache
+        local_rules_cache = load_local_rules()
+        mounted_ids = {item.rule_id for item in state.mounted_rules}
+        local_map = {item.rule_id: item for item in local_rules_cache}
+        state.mounted_rules = [local_map[item] for item in mounted_ids if item in local_map]
+        refresh_tactical_backpack()
+
+    def on_open_rule_mount_panel(_: ft.ControlEvent) -> None:
+        reload_local_rules()
+
+        def on_refresh_mount_rules(_: ft.ControlEvent) -> None:
+            reload_local_rules()
+            page.update()
+
+        mount_dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("🎒 配置战术背包（挂载法则）"),
+            content=ft.Container(
+                width=980,
+                height=650,
+                content=ft.Column(
+                    controls=[
+                        ft.Row([ft.OutlinedButton("刷新本地法则", on_click=on_refresh_mount_rules)], alignment=ft.MainAxisAlignment.END),
+                        tactical_rules_box,
+                    ],
+                    spacing=10,
+                    expand=True,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+            ),
+            actions=[ft.TextButton("关闭", on_click=lambda _: setattr(mount_dialog, "open", False))],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(mount_dialog)
+        mount_dialog.open = True
+        page.update()
+
+    def on_extract_rule(_: ft.ControlEvent) -> None:
+        source_text = (rule_source_input.value or "").strip()
+        if not source_text:
+            show_info_dialog("请先粘贴要提炼的文本素材。")
+            return
+        target_category = rule_category_dropdown.value or "Elements"
+        show_loading(page, with_rules_hint("正在深度提炼写作法则..."))
+        try:
+            if target_category == "Elements":
+                result = anatomize_fiction_snippet(
+                    text=source_text,
+                    element_target=(element_target_input.value or "综合").strip(),
+                    model=state.models["supervisor"],
+                )
+            else:
+                result = distill_tutorial_to_rule(
+                    text=source_text,
+                    category_target=target_category,
+                    model=state.models["supervisor"],
+                )
+            latest_rule_ref["rule"] = result
+            render_rule_result(result)
+            set_status("法则提炼完成。")
+        except Exception as exc:
+            latest_rule_ref["rule"] = None
+            render_rule_result(None)
+            show_info_dialog(f"法则提炼失败：{exc}")
+        finally:
+            hide_loading(page)
+            page.update()
+
+    def on_save_rule(_: ft.ControlEvent) -> None:
+        rule = latest_rule_ref.get("rule")
+        if rule is None:
+            show_info_dialog("暂无可保存法则。")
+            return
+        if not rule.rule_id.strip():
+            rule = rule.model_copy(update={"rule_id": datetime.now().strftime("rule_%Y%m%d_%H%M%S")})
+        save_writing_rule(rule)
+        latest_rule_ref["rule"] = rule
+        reload_local_rules()
+        set_status(f"法则已保存：{rule.rule_name}")
+        page.update()
+
     def get_project_name() -> str:
+        if state.project_name.strip():
+            return state.project_name.strip()
         if state.book_outline and state.book_outline.book_title.strip():
             return state.book_outline.book_title.strip()
         return "未命名脑洞"
+
+    def _project_dir_path(project_name: str | None = None) -> Path:
+        _projects_dir().mkdir(parents=True, exist_ok=True)
+        safe_name = sanitize_archive_filename(project_name or get_project_name())
+        return _projects_dir() / safe_name
+
+    def _project_meta_path(project_name: str | None = None) -> Path:
+        return _project_dir_path(project_name) / "meta.json"
+
+    def _project_chapters_dir(project_name: str | None = None) -> Path:
+        return _project_dir_path(project_name) / "chapters"
+
+    def _chapter_markdown_filename(volume_num: int, chapter_num: int) -> str:
+        return f"v{volume_num}_c{chapter_num}.md"
+
+    def _write_chapter_markdown(volume_num: int, chapter_num: int, text: str) -> str:
+        chapters_dir = _project_chapters_dir(state.project_name)
+        chapters_dir.mkdir(parents=True, exist_ok=True)
+        filename = _chapter_markdown_filename(volume_num, chapter_num)
+        chapter_path = chapters_dir / filename
+        chapter_path.write_text(text, encoding="utf-8")
+        return f"chapters/{filename}"
+
+    def _read_chapter_markdown(relative_path: str) -> str:
+        path = _project_dir_path(state.project_name) / relative_path
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+    def _parse_chapter_text_key(key: str) -> tuple[int, int] | None:
+        parts = str(key).split(":")
+        if len(parts) != 2:
+            return None
+        try:
+            return int(parts[0]), int(parts[1])
+        except Exception:
+            return None
+
+    def save_chapter_text(text_key: str, text: str) -> None:
+        parsed = _parse_chapter_text_key(text_key)
+        if parsed is None:
+            return
+        volume_num, chapter_num = parsed
+        relative_path = _write_chapter_markdown(volume_num, chapter_num, text)
+        state.chapter_files[text_key] = relative_path
+        state.chapter_texts[text_key] = text
+
+    def _legacy_payload_to_meta_payload(payload: dict[str, Any], project_name: str) -> dict[str, Any]:
+        snapshot = payload.get("app_state") if isinstance(payload.get("app_state"), dict) else payload
+        app_state = dict(snapshot) if isinstance(snapshot, dict) else {}
+        chapter_texts_data = app_state.get("chapter_texts")
+        chapter_files: dict[str, str] = {}
+        if isinstance(chapter_texts_data, dict):
+            for raw_key, raw_text in chapter_texts_data.items():
+                key = str(raw_key)
+                text = str(raw_text)
+                parsed = _parse_chapter_text_key(key)
+                if parsed is None:
+                    continue
+                volume_num, chapter_num = parsed
+                filename = _chapter_markdown_filename(volume_num, chapter_num)
+                chapter_files[key] = f"chapters/{filename}"
+                chapter_path = _project_chapters_dir(project_name) / filename
+                chapter_path.parent.mkdir(parents=True, exist_ok=True)
+                chapter_path.write_text(text, encoding="utf-8")
+        app_state["chapter_files"] = chapter_files
+        app_state.pop("chapter_texts", None)
+        return {
+            "app_state": app_state,
+            "project_name": str(payload.get("project_name") or project_name),
+            "save_stage": str(payload.get("save_stage") or app_state.get("save_stage") or STAGE_CONCEPT),
+            "saved_at": str(payload.get("saved_at") or datetime.now().isoformat()),
+        }
+
+    def migrate_legacy_project_json(legacy_json_path: Path) -> Path:
+        try:
+            payload = json.loads(legacy_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            return legacy_json_path
+        project_name = str(payload.get("project_name") or legacy_json_path.stem)
+        project_dir = _project_dir_path(project_name)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = project_dir / "meta.json"
+        migrated_payload = _legacy_payload_to_meta_payload(payload, project_name)
+        meta_path.write_text(json.dumps(migrated_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            legacy_json_path.unlink()
+        except Exception:
+            pass
+        return meta_path
+
+    def resolve_project_meta_path(project_ref: Path) -> Path:
+        if project_ref.is_dir():
+            return project_ref / "meta.json"
+        if project_ref.suffix.lower() == ".json":
+            return migrate_legacy_project_json(project_ref)
+        return project_ref
 
     async def focus_control(control: ft.Control) -> None:
         await control.focus()
@@ -456,9 +774,11 @@ def main(page: ft.Page) -> None:
         return cleaned or "未命名作品"
 
     def save_full_archive() -> Path:
-        _data_dir().mkdir(parents=True, exist_ok=True)
-        base_name = get_project_name()
-        file_name = f"{sanitize_archive_filename(base_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        state.project_name = get_project_name()
+        project_dir = _project_dir_path(state.project_name)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        _project_chapters_dir(state.project_name).mkdir(parents=True, exist_ok=True)
+        project_path = _project_meta_path(state.project_name)
         volumes_data = {str(num): item.model_dump() for num, item in state.volumes.items()}
         chapters_data = {str(num): item.model_dump() for num, item in state.chapter_outlines.items()}
         app_state_snapshot = {
@@ -468,25 +788,75 @@ def main(page: ft.Page) -> None:
             "book_outline": state.book_outline.model_dump() if state.book_outline else None,
             "volumes": volumes_data,
             "chapter_outlines": chapters_data,
+            "chapter_files": state.chapter_files,
             "selected_volume_num": state.selected_volume_num,
             "active_traits": state.active_traits.model_dump() if state.active_traits else None,
+            "characters": state.characters,
+            "world_settings": state.world_settings,
+            "items": state.items,
+            "mounted_rule_ids": [item.rule_id for item in state.mounted_rules],
         }
         payload = {
             "app_state": app_state_snapshot,
-            "project_name": get_project_name(),
+            "project_name": state.project_name,
             "save_stage": state.current_stage,
             "chat_history": app_state_snapshot["chat_history"],
             "quick_options": app_state_snapshot["quick_options"],
             "current_concept": app_state_snapshot["current_concept"],
             "book_outline": app_state_snapshot["book_outline"],
             "chapter_outlines": app_state_snapshot["chapter_outlines"],
+            "chapter_files": app_state_snapshot["chapter_files"],
             "volumes": app_state_snapshot["volumes"],
             "active_traits": app_state_snapshot["active_traits"],
+            "characters": app_state_snapshot["characters"],
+            "world_settings": app_state_snapshot["world_settings"],
+            "items": app_state_snapshot["items"],
+            "mounted_rule_ids": app_state_snapshot["mounted_rule_ids"],
             "saved_at": datetime.now().isoformat(),
         }
-        path = _data_dir() / file_name
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        project_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return project_path
+
+    def list_projects() -> list[tuple[Path, str, str]]:
+        _projects_dir().mkdir(parents=True, exist_ok=True)
+        result: list[tuple[Path, str, str]] = []
+        entries: list[Path] = list(_projects_dir().iterdir())
+        for path in sorted(entries, key=lambda p: p.stat().st_mtime, reverse=True):
+            if path.is_dir():
+                meta_path = path / "meta.json"
+                if not meta_path.exists():
+                    continue
+            elif path.suffix.lower() == ".json":
+                meta_path = migrate_legacy_project_json(path)
+                path = meta_path.parent
+            else:
+                continue
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            project_name = str(payload.get("project_name") or path.name)
+            saved_at = str(payload.get("saved_at") or datetime.fromtimestamp(meta_path.stat().st_mtime).isoformat())
+            result.append((path, project_name, saved_at))
+        return result
+
+    def save_writing_rule(rule: WritingRule) -> Path:
+        _rules_dir().mkdir(parents=True, exist_ok=True)
+        file_name = f"{sanitize_archive_filename(rule.rule_id)}.json"
+        path = _rules_dir() / file_name
+        path.write_text(json.dumps(rule.model_dump(), ensure_ascii=False, indent=2), encoding="utf-8")
         return path
+
+    def load_local_rules() -> list[WritingRule]:
+        _rules_dir().mkdir(parents=True, exist_ok=True)
+        rules: list[WritingRule] = []
+        for path in sorted(_rules_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                rules.append(WritingRule.model_validate(payload))
+            except Exception:
+                continue
+        return rules
 
     def load_chat_from_cache() -> bool:
         path = _chat_cache_path()
@@ -524,13 +894,12 @@ def main(page: ft.Page) -> None:
         return path
 
     def scan_archives() -> list[tuple[str, str, str]]:
-        _data_dir().mkdir(parents=True, exist_ok=True)
+        _projects_dir().mkdir(parents=True, exist_ok=True)
         result: list[tuple[str, str, str]] = []
-        for path in sorted(_data_dir().glob("*.json"), reverse=True):
-            if path.name == "chat_cache.json":
-                continue
+        for project_path, _, _ in list_projects():
+            meta_path = project_path / "meta.json"
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 continue
             project_name = str(payload.get("project_name") or "未命名脑洞")
@@ -539,7 +908,7 @@ def main(page: ft.Page) -> None:
             stage = raw_stage if raw_stage in {STAGE_CONCEPT, STAGE_OUTLINE, STAGE_CHAPTERS} else STAGE_CONCEPT
             time_text = saved_at[0:19].replace("T", " ") if saved_at else "未知时间"
             label = f"【{project_name}】 - {time_text} - {stage}"
-            result.append((path.name, label, stage))
+            result.append((project_path.name, label, stage))
         return result
 
     def sync_theme_toggle() -> None:
@@ -556,64 +925,6 @@ def main(page: ft.Page) -> None:
         page.update()
 
     theme_toggle_btn.on_click = on_toggle_theme
-
-    def save_tomato() -> None:
-        path = _tomato_path()
-        path.write_text(json.dumps(tomato_data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def render_banned_words() -> None:
-        words = tomato_data.get("banned_words", [])
-        banned_words_wrap.controls = [
-            ft.Chip(
-                label=ft.Text(word),
-                bgcolor=ft.Colors.BLUE_GREY_800,
-                color=ft.Colors.BLUE_300,
-                delete_icon=ft.Icon(ft.Icons.CLOSE),
-                on_delete=lambda _, index=i: on_delete_banned_word(index),
-            )
-            for i, word in enumerate(words)
-        ]
-
-    def render_pacing_rules() -> None:
-        rules = tomato_data.get("pacing_rules", [])
-        controls: list[ft.Control] = []
-        for idx, rule in enumerate(rules):
-            def on_rule_blur(_: ft.ControlEvent, index: int = idx) -> None:
-                rule_field = pacing_rules_box.controls[index]
-                tomato_data["pacing_rules"][index] = rule_field.value or ""
-                save_tomato()
-            controls.append(
-                ft.TextField(
-                    label=f"规则 {idx + 1}",
-                    value=str(rule),
-                    multiline=True,
-                    min_lines=1,
-                    max_lines=3,
-                    on_blur=on_rule_blur,
-                )
-            )
-        pacing_rules_box.controls = controls
-
-    def on_delete_banned_word(index: int) -> None:
-        words = tomato_data.get("banned_words", [])
-        if 0 <= index < len(words):
-            words.pop(index)
-            tomato_data["banned_words"] = words
-            save_tomato()
-            render_banned_words()
-            page.update()
-
-    def on_add_banned_word(_: ft.ControlEvent) -> None:
-        new_word = (banned_word_input.value or "").strip()
-        if not new_word:
-            return
-        words = tomato_data.get("banned_words", [])
-        words.append(new_word)
-        tomato_data["banned_words"] = words
-        banned_word_input.value = ""
-        save_tomato()
-        render_banned_words()
-        page.update()
 
     def sync_mapping_dropdowns() -> None:
         alias_options = [ft.dropdown.Option(item.get("alias", "")) for item in state.model_entries if item.get("alias")]
@@ -742,38 +1053,11 @@ def main(page: ft.Page) -> None:
         settings_status.value = "状态：API Key 已实时保存。"
         page.update()
 
-    def on_tomato_json_blur(_: ft.ControlEvent) -> None:
-        try:
-            parsed = json.loads(tomato_json_box.value or "{}")
-        except json.JSONDecodeError as exc:
-            settings_status.value = f"状态：tomato.json 预览格式错误 - {exc}"
-            page.update()
-            return
-        tomato_data.clear()
-        tomato_data.update(parsed)
-        save_tomato()
-        render_pacing_rules()
-        render_banned_words()
-        settings_status.value = "状态：tomato.json 已实时保存。"
-        page.update()
-
     supervisor_mapping_dropdown.on_change = on_mapping_change
     planner_mapping_dropdown.on_change = on_mapping_change
     drafter_mapping_dropdown.on_change = on_mapping_change
     checker_mapping_dropdown.on_change = on_mapping_change
     api_key_input.on_blur = on_api_key_blur
-    tomato_json_box.on_blur = on_tomato_json_blur
-
-    def load_tomato() -> None:
-        path = _tomato_path()
-        if not path.exists():
-            settings_status.value = "状态：未找到 tomato.json"
-            return
-        nonlocal tomato_data
-        tomato_data = json.loads(path.read_text(encoding="utf-8"))
-        tomato_json_box.value = json.dumps(tomato_data, ensure_ascii=False, indent=2)
-        render_pacing_rules()
-        render_banned_words()
 
     def sync_chapter_picker() -> None:
         options: list[ft.dropdown.Option] = []
@@ -836,20 +1120,23 @@ def main(page: ft.Page) -> None:
             book_outline_box.visible = True
             volume_outline_box.visible = True
 
-    def on_select_volume(volume_num: int) -> None:
+    def on_select_volume(volume_num: int, refresh_page: bool = True) -> None:
         state.selected_volume_num = volume_num
         state.volume_outline = state.volumes.get(volume_num)
         state.chapter_outline = state.chapter_outlines.get(volume_num)
+        render_volume_cards()
         render_outline_boards()
         chapter_outline_box.value = state.chapter_outline.model_dump_json(indent=2) if state.chapter_outline else ""
         sync_chapter_picker()
         render_chapter_cards()
-        page.update()
+        if refresh_page:
+            page.update()
 
     def render_volume_cards() -> None:
         cards: list[ft.Control] = []
         for volume_num in sorted(state.volumes.keys()):
             outline = state.volumes[volume_num]
+            is_selected = state.selected_volume_num == volume_num
 
             def on_pick(_: ft.ControlEvent, number: int = volume_num) -> None:
                 on_select_volume(number)
@@ -857,6 +1144,7 @@ def main(page: ft.Page) -> None:
             cards.append(
                 ft.Card(
                     content=ft.Container(
+                        bgcolor=ft.Colors.BLUE_GREY_800 if is_selected else ft.Colors.BLUE_GREY_900,
                         padding=10,
                         content=ft.Row(
                             controls=[
@@ -949,10 +1237,41 @@ def main(page: ft.Page) -> None:
     def render_outline_boards() -> None:
         book_outline_box.value = format_book_outline(state.book_outline) if state.book_outline else ""
         volume_outline_box.value = format_volume_outline(state.volume_outline) if state.volume_outline else ""
+        book_outline_context_box.value = format_book_outline(state.book_outline) if state.book_outline else ""
         if state.volume_outline is None:
             selected_volume_title.value = "当前未选中分卷"
         else:
             selected_volume_title.value = f"当前分卷：第 {state.volume_outline.volume_number} 卷《{state.volume_outline.volume_title}》"
+
+    def refresh_all_views(current_page: ft.Page, app_state: AppState) -> None:
+        refresh_chat_view(persist=False)
+        render_quick_options()
+        sync_proposal_board()
+        sync_active_traits_inputs()
+        if app_state.volumes:
+            if app_state.selected_volume_num is None or app_state.selected_volume_num not in app_state.volumes:
+                app_state.selected_volume_num = sorted(app_state.volumes.keys())[-1]
+            app_state.volume_outline = app_state.volumes.get(app_state.selected_volume_num)
+            app_state.chapter_outline = app_state.chapter_outlines.get(app_state.selected_volume_num)
+        else:
+            app_state.selected_volume_num = None
+            app_state.volume_outline = None
+            app_state.chapter_outline = None
+        render_volume_cards()
+        render_outline_boards()
+        if app_state.book_outline is None:
+            book_outline_mount_status.value = "总纲挂载状态：未挂载（请先生成或加载全书总纲）"
+            book_outline_mount_status.color = ft.Colors.RED_300
+            ai_volume_outline_btn.disabled = True
+        else:
+            title = app_state.book_outline.book_title.strip() or "未命名作品"
+            book_outline_mount_status.value = f"总纲挂载状态：已挂载《{title}》"
+            book_outline_mount_status.color = ft.Colors.GREEN_300
+            ai_volume_outline_btn.disabled = False
+        chapter_outline_box.value = app_state.chapter_outline.model_dump_json(indent=2) if app_state.chapter_outline else ""
+        sync_outline_visibility()
+        sync_chapter_picker()
+        render_chapter_cards()
 
     def build_bubble(role: str, text: str) -> ft.Control:
         is_user = role == "user"
@@ -1018,6 +1337,7 @@ def main(page: ft.Page) -> None:
             traits = update_active_traits_from_inputs()
             save_active_traits(traits, update_reason="UI档案保存")
             refresh_entity_view()
+            save_full_archive()
             set_status("已保存到档案库。")
         except Exception as exc:
             set_status(f"档案保存失败：{exc}")
@@ -1063,6 +1383,7 @@ def main(page: ft.Page) -> None:
         state.quick_options = []
         set_stage(STAGE_CONCEPT)
         outlining_status.value = "状态：主编正在组织头脑风暴..."
+        show_loading(page, with_rules_hint("主编正在头脑风暴..."))
         page.update()
         try:
             run_brainstorm_cycle(initial)
@@ -1075,6 +1396,7 @@ def main(page: ft.Page) -> None:
             start_brainstorm_btn.disabled = False
             start_brainstorm_btn.text = "🧠 开始头脑风暴"
             start_brainstorm_ring.visible = False
+            hide_loading(page)
         page.update()
 
     def on_send_sandbox(_: ft.ControlEvent) -> None:
@@ -1087,36 +1409,45 @@ def main(page: ft.Page) -> None:
             state.quick_options = []
             set_stage(STAGE_CONCEPT)
             outlining_status.value = "状态：主编正在组织头脑风暴..."
+            show_loading(page, with_rules_hint("主编正在头脑风暴..."))
             page.update()
             try:
                 run_brainstorm_cycle(message)
                 outlining_status.value = "状态：头脑风暴进行中。"
             except Exception as exc:
                 outlining_status.value = f"状态：头脑风暴失败 - {exc}"
+            finally:
+                hide_loading(page)
             page.update()
             return
         state.chat_history.append({"role": "user", "content": message})
         chat_input.value = ""
         refresh_chat_view()
         outlining_status.value = "状态：主编正在回应..."
+        show_loading(page, with_rules_hint("主编正在回应..."))
         page.update()
         try:
             run_brainstorm_cycle(message)
             outlining_status.value = "状态：头脑风暴进行中。"
         except Exception as exc:
             outlining_status.value = f"状态：头脑风暴失败 - {exc}"
+        finally:
+            hide_loading(page)
         page.update()
 
     def on_pick_quick_option(option: str) -> None:
         state.chat_history.append({"role": "user", "content": option})
         refresh_chat_view()
         outlining_status.value = "状态：主编正在回应..."
+        show_loading(page, with_rules_hint("主编正在处理快捷方案..."))
         page.update()
         try:
             run_brainstorm_cycle(option)
             outlining_status.value = "状态：已应用快捷方案。"
         except Exception as exc:
             outlining_status.value = f"状态：快捷方案失败 - {exc}"
+        finally:
+            hide_loading(page)
         page.update()
 
     def on_spark_click(text: str) -> None:
@@ -1130,24 +1461,30 @@ def main(page: ft.Page) -> None:
             state.quick_options = []
             set_stage(STAGE_CONCEPT)
             outlining_status.value = "状态：主编正在组织头脑风暴..."
+            show_loading(page, with_rules_hint("主编正在处理灵感火花..."))
             page.update()
             try:
                 run_brainstorm_cycle(message)
                 outlining_status.value = "状态：头脑风暴进行中。"
             except Exception as exc:
                 outlining_status.value = f"状态：头脑风暴失败 - {exc}"
+            finally:
+                hide_loading(page)
             page.update()
             return
         state.chat_history.append({"role": "user", "content": message})
         chat_input.value = ""
         refresh_chat_view()
         outlining_status.value = "状态：主编正在回应..."
+        show_loading(page, with_rules_hint("主编正在处理灵感火花..."))
         page.update()
         try:
             run_brainstorm_cycle(message)
             outlining_status.value = "状态：已应用灵感火花。"
         except Exception as exc:
             outlining_status.value = f"状态：灵感火花失败 - {exc}"
+        finally:
+            hide_loading(page)
         page.update()
 
     def on_save_chat_markdown(_: ft.ControlEvent) -> None:
@@ -1157,8 +1494,8 @@ def main(page: ft.Page) -> None:
             return
         path = save_full_archive()
         refresh_archive_options()
-        archive_dropdown.value = path.name
-        set_status(f"存档已保存：{path.name}")
+        archive_dropdown.value = path.parent.name
+        set_status(f"项目已保存：{path.parent.name}")
         page.update()
 
     def refresh_archive_options() -> None:
@@ -1183,24 +1520,25 @@ def main(page: ft.Page) -> None:
         set_status("已切换存档分类。")
         page.update()
 
-    def on_load_selected_archive(_: ft.ControlEvent) -> None:
-        file_name = archive_dropdown.value or ""
-        if not file_name:
-            set_status("请先选择历史存档。")
-            page.update()
-            return
-        path = _data_dir() / file_name
-        if not path.exists():
-            set_status("存档文件不存在。")
-            page.update()
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            set_status(f"存档解析失败：{exc}")
-            page.update()
-            return
+    def hydrate_state_from_payload(payload: dict[str, Any], fallback_project_name: str = "未命名脑洞") -> None:
         snapshot = payload.get("app_state") if isinstance(payload.get("app_state"), dict) else payload
+        state.project_name = str(payload.get("project_name") or fallback_project_name)
+        state.chat_history = []
+        state.quick_options = []
+        state.concept_proposal = None
+        state.book_outline = None
+        state.volumes = {}
+        state.chapter_outlines = {}
+        state.chapter_texts = {}
+        state.chapter_files = {}
+        state.selected_volume_num = None
+        state.volume_outline = None
+        state.chapter_outline = None
+        state.active_traits = None
+        state.characters = []
+        state.world_settings = []
+        state.items = []
+        state.mounted_rules = []
         raw_chat = snapshot.get("chat_history", []) or []
         normalized_chat: list[dict[str, str]] = []
         if isinstance(raw_chat, list):
@@ -1221,7 +1559,6 @@ def main(page: ft.Page) -> None:
         book_data = snapshot.get("book_outline")
         state.book_outline = BookOutline.model_validate(book_data) if isinstance(book_data, dict) else None
         volumes_data = snapshot.get("volumes")
-        state.volumes = {}
         if isinstance(volumes_data, dict):
             for key, value in volumes_data.items():
                 try:
@@ -1233,26 +1570,36 @@ def main(page: ft.Page) -> None:
             parsed_legacy = VolumeOutline.model_validate(legacy_volume)
             state.volumes[parsed_legacy.volume_number] = parsed_legacy
         chapters_data = snapshot.get("chapter_outlines")
-        state.chapter_outlines = {}
         if isinstance(chapters_data, dict):
             for key, value in chapters_data.items():
                 try:
                     state.chapter_outlines[int(key)] = ChapterOutlineList.model_validate(value)
                 except Exception:
                     continue
-        elif isinstance(chapters_data, list):
-            pass
         legacy_chapter = snapshot.get("chapter_outline")
         if not state.chapter_outlines and isinstance(legacy_chapter, dict):
             parsed_legacy_chapter = ChapterOutlineList.model_validate(legacy_chapter)
             state.chapter_outlines[parsed_legacy_chapter.volume_number] = parsed_legacy_chapter
+        chapter_files_data = snapshot.get("chapter_files")
+        if isinstance(chapter_files_data, dict):
+            state.chapter_files = {str(k): str(v) for k, v in chapter_files_data.items() if str(k).strip()}
+        chapter_texts_data = snapshot.get("chapter_texts")
+        if isinstance(chapter_texts_data, dict):
+            for raw_key, raw_text in chapter_texts_data.items():
+                key = str(raw_key)
+                text = str(raw_text)
+                state.chapter_texts[key] = text
+                parsed = _parse_chapter_text_key(key)
+                if parsed is None:
+                    continue
+                volume_num, chapter_num = parsed
+                relative_path = _write_chapter_markdown(volume_num, chapter_num, text)
+                state.chapter_files[key] = relative_path
         selected_volume = snapshot.get("selected_volume_num")
         if isinstance(selected_volume, int):
             state.selected_volume_num = selected_volume
         elif state.volumes:
-            state.selected_volume_num = sorted(state.volumes.keys())[0]
-        else:
-            state.selected_volume_num = None
+            state.selected_volume_num = sorted(state.volumes.keys())[-1]
         state.volume_outline = state.volumes.get(state.selected_volume_num) if state.selected_volume_num is not None else None
         state.chapter_outline = (
             state.chapter_outlines.get(state.selected_volume_num) if state.selected_volume_num is not None else None
@@ -1260,24 +1607,54 @@ def main(page: ft.Page) -> None:
         traits_data = snapshot.get("active_traits")
         if isinstance(traits_data, dict):
             state.active_traits = NLPBaseTraits.model_validate(traits_data)
-        refresh_chat_view()
-        render_quick_options()
-        sync_proposal_board()
-        render_volume_cards()
-        render_outline_boards()
-        chapter_outline_box.value = state.chapter_outline.model_dump_json(indent=2) if state.chapter_outline else ""
-        sync_outline_visibility()
-        sync_chapter_picker()
-        render_chapter_cards()
-        sync_active_traits_inputs()
-        if state.chapter_outline:
-            set_stage(STAGE_CHAPTERS)
-        elif state.volumes:
-            set_stage(STAGE_CHAPTERS)
-        elif state.book_outline:
-            set_stage(STAGE_OUTLINE)
         else:
-            set_stage(STAGE_CONCEPT)
+            state.active_traits = load_default_traits()
+        chars = snapshot.get("characters")
+        worlds = snapshot.get("world_settings")
+        items = snapshot.get("items")
+        state.characters = chars if isinstance(chars, list) else []
+        state.world_settings = worlds if isinstance(worlds, list) else []
+        state.items = items if isinstance(items, list) else []
+        mounted_ids = snapshot.get("mounted_rule_ids")
+        if isinstance(mounted_ids, list):
+            local_map = {item.rule_id: item for item in load_local_rules()}
+            state.mounted_rules = [local_map[item] for item in mounted_ids if isinstance(item, str) and item in local_map]
+        raw_stage = str(payload.get("save_stage") or snapshot.get("save_stage") or "").upper()
+        stage_from_archive = raw_stage if raw_stage in {STAGE_CONCEPT, STAGE_OUTLINE, STAGE_CHAPTERS} else ""
+        if stage_from_archive:
+            state.current_stage = stage_from_archive
+        elif state.chapter_outline or state.volumes:
+            state.current_stage = STAGE_CHAPTERS
+        elif state.book_outline:
+            state.current_stage = STAGE_OUTLINE
+        else:
+            state.current_stage = STAGE_CONCEPT
+
+    def on_load_selected_archive(_: ft.ControlEvent) -> None:
+        file_name = archive_dropdown.value or ""
+        if not file_name:
+            set_status("请先选择历史存档。")
+            page.update()
+            return
+        project_ref = _projects_dir() / file_name
+        if not project_ref.exists():
+            set_status("存档文件不存在。")
+            page.update()
+            return
+        path = resolve_project_meta_path(project_ref)
+        if not path.exists():
+            set_status("存档元数据不存在。")
+            page.update()
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            set_status(f"存档解析失败：{exc}")
+            page.update()
+            return
+        hydrate_state_from_payload(payload, fallback_project_name=path.parent.name)
+        refresh_all_views(page, state)
+        set_stage(state.current_stage)
         set_status(f"存档 {file_name} 加载成功。")
         page.update()
 
@@ -1289,9 +1666,16 @@ def main(page: ft.Page) -> None:
             state.chat_history = []
             state.quick_options = []
             state.concept_proposal = None
+            state.project_name = "未命名脑洞"
             state.book_outline = None
             state.volumes = {}
             state.chapter_outlines = {}
+            state.chapter_texts = {}
+            state.chapter_files = {}
+            state.characters = []
+            state.world_settings = []
+            state.items = []
+            state.mounted_rules = []
             state.selected_volume_num = None
             state.volume_outline = None
             state.chapter_outline = None
@@ -1330,9 +1714,8 @@ def main(page: ft.Page) -> None:
 
     def on_quick_jump_stage(_: ft.ControlEvent) -> None:
         target = stage_jump_dropdown.value or STAGE_CONCEPT
-        if target == STAGE_CHAPTERS and state.selected_volume_num is None and state.volumes:
-            state.selected_volume_num = sorted(state.volumes.keys())[0]
-            on_select_volume(state.selected_volume_num)
+        if target == STAGE_CHAPTERS:
+            refresh_all_views(page, state)
         set_stage(target)
         set_status(f"已切换到 {target} 阶段。")
         page.update()
@@ -1343,15 +1726,13 @@ def main(page: ft.Page) -> None:
         page.update()
 
     def on_nav_to_outline(_: ft.ControlEvent) -> None:
+        refresh_all_views(page, state)
         set_stage(STAGE_OUTLINE)
         set_status("已切换到全书总纲。")
         page.update()
 
     def on_nav_to_chapters(_: ft.ControlEvent) -> None:
-        if state.selected_volume_num is None:
-            if state.volumes:
-                state.selected_volume_num = sorted(state.volumes.keys())[0]
-                on_select_volume(state.selected_volume_num)
+        refresh_all_views(page, state)
         set_stage(STAGE_CHAPTERS)
         set_status("已切换到分卷与章节。")
         page.update()
@@ -1370,6 +1751,7 @@ def main(page: ft.Page) -> None:
             return
         outlining_status.value = "状态：正在定稿策划案..."
         set_status("主编 Agent 正在收敛故事核心策划案...")
+        show_loading(page, with_rules_hint("正在定稿策划案..."))
         page.update()
         try:
             proposal = finalize_proposal(user_responses=user_responses, model=state.models["supervisor"])
@@ -1386,6 +1768,7 @@ def main(page: ft.Page) -> None:
             finalize_proposal_btn.disabled = False
             finalize_proposal_btn.text = "✅ 定稿策划案"
             finalize_proposal_ring.visible = False
+            hide_loading(page)
         page.update()
 
     def on_chapter_pick(_: ft.ControlEvent) -> None:
@@ -1405,11 +1788,22 @@ def main(page: ft.Page) -> None:
             return
         chapter_num_input.value = str(selected_number)
         chapter_idea_input.value = str(matched.get("core_event", ""))
+        current_volume = state.selected_volume_num if state.selected_volume_num is not None else 0
+        text_key = f"{current_volume}:{selected_number}"
+        if text_key in state.chapter_texts:
+            loaded_text = state.chapter_texts.get(text_key, "")
+        else:
+            relative_path = state.chapter_files.get(text_key, "")
+            loaded_text = _read_chapter_markdown(relative_path) if relative_path else ""
+            if loaded_text:
+                state.chapter_texts[text_key] = loaded_text
+        pipeline_output.value = loaded_text
+        pipeline_stream.controls = [ft.Text(line) for line in loaded_text.splitlines()]
         page.update()
 
     chapter_picker.on_change = on_chapter_pick
 
-    def build_character_tile(row: dict[str, Any]) -> ft.ExpansionTile:
+    def build_character_tile(row: dict[str, Any], index: int) -> ft.ExpansionTile:
         entity_id = ft.TextField(label="角色ID", value=str(row.get("entity_id", "")))
         version_chapter = ft.TextField(label="版本章号", value=str(row.get("version_chapter", "")))
         environment = ft.TextField(label="environment", value=str(row.get("environment", "")), multiline=True)
@@ -1421,34 +1815,21 @@ def main(page: ft.Page) -> None:
         update_reason = ft.TextField(label="update_reason", value=str(row.get("update_reason", "")))
 
         def save_character(_: ft.ControlEvent) -> None:
-            traits_json = json.dumps(
-                {
-                    "environment": environment.value or "",
-                    "behavior": behavior.value or "",
-                    "capability": capability.value or "",
-                    "values": values.value or "",
-                    "identity": identity.value or "",
-                    "vision": vision.value or "",
-                },
-                ensure_ascii=False,
-            )
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    """
-                    UPDATE character_traits
-                    SET entity_id = ?, version_chapter = ?, traits_json = ?, update_reason = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        entity_id.value or "",
-                        int(version_chapter.value or "1"),
-                        traits_json,
-                        update_reason.value or "UI更新",
-                        int(row["id"]),
-                    ),
-                )
-                conn.commit()
-            refresh_entity_view()
+            state.characters[index] = {
+                "id": row.get("id", index + 1),
+                "entity_id": entity_id.value or "",
+                "version_chapter": int(version_chapter.value or "1"),
+                "environment": environment.value or "",
+                "behavior": behavior.value or "",
+                "capability": capability.value or "",
+                "values": values.value or "",
+                "identity": identity.value or "",
+                "vision": vision.value or "",
+                "update_reason": update_reason.value or "UI更新",
+            }
+            save_full_archive()
+            render_character_cards()
+            page.update()
 
         return ft.ExpansionTile(
             title=ft.Text(f"人物卡：{row.get('entity_id', '')}"),
@@ -1470,7 +1851,7 @@ def main(page: ft.Page) -> None:
             ],
         )
 
-    def build_world_tile(row: dict[str, Any]) -> ft.ExpansionTile:
+    def build_world_tile(row: dict[str, Any], index: int) -> ft.ExpansionTile:
         region_name = ft.TextField(label="region_name", value=str(row.get("region_name", "")))
         tech_level = ft.TextField(label="tech_level", value=str(row.get("tech_level", "")), multiline=True)
         power_structure = ft.TextField(
@@ -1479,23 +1860,16 @@ def main(page: ft.Page) -> None:
         hidden_rules = ft.TextField(label="hidden_rules", value=str(row.get("hidden_rules", "")), multiline=True)
 
         def save_world(_: ft.ControlEvent) -> None:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    """
-                    UPDATE world_cards
-                    SET region_name = ?, tech_level = ?, power_structure = ?, hidden_rules = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        region_name.value or "",
-                        tech_level.value or "",
-                        power_structure.value or "",
-                        hidden_rules.value or "",
-                        int(row["id"]),
-                    ),
-                )
-                conn.commit()
-            refresh_entity_view()
+            state.world_settings[index] = {
+                "id": row.get("id", index + 1),
+                "region_name": region_name.value or "",
+                "tech_level": tech_level.value or "",
+                "power_structure": power_structure.value or "",
+                "hidden_rules": hidden_rules.value or "",
+            }
+            save_full_archive()
+            render_world_cards()
+            page.update()
 
         return ft.ExpansionTile(
             title=ft.Text(f"世界卡：{row.get('region_name', '')}"),
@@ -1512,7 +1886,7 @@ def main(page: ft.Page) -> None:
             ],
         )
 
-    def build_item_tile(row: dict[str, Any]) -> ft.ExpansionTile:
+    def build_item_tile(row: dict[str, Any], index: int) -> ft.ExpansionTile:
         item_name = ft.TextField(label="锚点名称", value=str(row.get("item_name", "")))
         origin = ft.TextField(label="来历", value=str(row.get("origin", "")), multiline=True)
         current_owner = ft.TextField(label="当前持有者", value=str(row.get("current_owner", "")))
@@ -1521,25 +1895,18 @@ def main(page: ft.Page) -> None:
         story_hook = ft.TextField(label="剧情钩子", value=str(row.get("story_hook", "")), multiline=True)
 
         def save_item(_: ft.ControlEvent) -> None:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    """
-                    UPDATE item_cards
-                    SET item_name = ?, origin = ?, current_owner = ?, hidden_power = ?, item_function = ?, story_hook = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        item_name.value or "",
-                        origin.value or "",
-                        current_owner.value or "",
-                        hidden_power.value or "",
-                        item_function.value or "",
-                        story_hook.value or "",
-                        int(row["id"]),
-                    ),
-                )
-                conn.commit()
-            refresh_entity_view()
+            state.items[index] = {
+                "id": row.get("id", index + 1),
+                "item_name": item_name.value or "",
+                "origin": origin.value or "",
+                "current_owner": current_owner.value or "",
+                "hidden_power": hidden_power.value or "",
+                "item_function": item_function.value or "",
+                "story_hook": story_hook.value or "",
+            }
+            save_full_archive()
+            render_item_cards()
+            page.update()
 
         return ft.ExpansionTile(
             title=ft.Text(f"剧情锚点/金手指：{row.get('item_name', '')}"),
@@ -1558,26 +1925,128 @@ def main(page: ft.Page) -> None:
             ],
         )
 
+    def render_character_cards() -> None:
+        character_cards_box.controls.clear()
+        if state.characters:
+            character_cards_box.controls.extend(build_character_tile(row, idx) for idx, row in enumerate(state.characters))
+        else:
+            character_cards_box.controls.append(ft.Text("暂无人物卡数据。"))
+
+    def render_world_cards() -> None:
+        world_cards_box.controls.clear()
+        if state.world_settings:
+            world_cards_box.controls.extend(build_world_tile(row, idx) for idx, row in enumerate(state.world_settings))
+        else:
+            world_cards_box.controls.append(ft.Text("暂无世界卡数据。"))
+
+    def render_item_cards() -> None:
+        item_cards_box.controls.clear()
+        if state.items:
+            item_cards_box.controls.extend(build_item_tile(row, idx) for idx, row in enumerate(state.items))
+        else:
+            item_cards_box.controls.append(ft.Text("暂无剧情锚点数据。"))
+
     def refresh_entity_view(_: ft.ControlEvent | None = None) -> None:
-        data = _load_entity_data()
-        controls: list[ft.Control] = []
-        controls.append(ft.Text("人物卡", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400))
-        if data["characters"]:
-            controls.extend(build_character_tile(row) for row in data["characters"])
-        else:
-            controls.append(ft.Text("暂无人物卡数据。"))
-        controls.append(ft.Text("世界卡", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400))
-        if data["worlds"]:
-            controls.extend(build_world_tile(row) for row in data["worlds"])
-        else:
-            controls.append(ft.Text("暂无世界卡数据。"))
-        controls.append(ft.Text("剧情锚点/金手指", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400))
-        if data["items"]:
-            controls.extend(build_item_tile(row) for row in data["items"])
-        else:
-            controls.append(ft.Text("暂无剧情锚点数据。"))
-        entity_panel.controls = controls
+        render_character_cards()
+        render_world_cards()
+        render_item_cards()
         page.update()
+
+    def on_add_character_card(_: ft.ControlEvent) -> None:
+        state.characters.append(
+            {
+                "id": len(state.characters) + 1,
+                "entity_id": f"角色{len(state.characters) + 1}",
+                "version_chapter": 1,
+                "environment": "",
+                "behavior": "",
+                "capability": "",
+                "values": "",
+                "identity": "",
+                "vision": "",
+                "update_reason": "手动新建",
+            }
+        )
+        save_full_archive()
+        render_character_cards()
+        page.update()
+
+    def on_add_world_card(_: ft.ControlEvent) -> None:
+        state.world_settings.append(
+            {
+                "id": len(state.world_settings) + 1,
+                "region_name": f"区域{len(state.world_settings) + 1}",
+                "tech_level": "",
+                "power_structure": "",
+                "hidden_rules": "",
+            }
+        )
+        save_full_archive()
+        render_world_cards()
+        page.update()
+
+    def on_ai_generate_character_card(_: ft.ControlEvent) -> None:
+        if state.book_outline is None:
+            show_info_dialog("请先完成或加载全书总纲")
+            return
+        show_loading(page, with_rules_hint("AI 正在生成人物卡..."))
+        try:
+            traits = derive_initial_traits(
+                user_idea=state.book_outline.logline,
+                book_outline=state.book_outline,
+                concept_proposal=state.concept_proposal,
+                model=state.models["supervisor"],
+            )
+            state.characters.append(
+                {
+                    "id": len(state.characters) + 1,
+                    "entity_id": f"AI角色{len(state.characters) + 1}",
+                    "version_chapter": 1,
+                    "environment": traits.environment,
+                    "behavior": traits.behavior,
+                    "capability": traits.capability,
+                    "values": traits.values,
+                    "identity": traits.identity,
+                    "vision": traits.vision,
+                    "update_reason": "AI生成",
+                }
+            )
+            save_full_archive()
+            render_character_cards()
+            page.update()
+        except Exception as exc:
+            show_info_dialog(f"AI 生成人物卡失败：{exc}")
+        finally:
+            hide_loading(page)
+
+    def on_ai_generate_world_card(_: ft.ControlEvent) -> None:
+        if state.book_outline is None:
+            show_info_dialog("请先完成或加载全书总纲")
+            return
+        show_loading(page, with_rules_hint("AI 正在生成世界卡..."))
+        try:
+            result = brainstorm_ideas(
+                current_idea=f"请基于以下总纲生成一张世界卡：{state.book_outline.logline}",
+                chat_history=state.chat_history,
+                model=state.models["supervisor"],
+            )
+            summary = str(result.get("assistant_reply", "")).strip()
+            state.world_settings.append(
+                {
+                    "id": len(state.world_settings) + 1,
+                    "region_name": f"AI区域{len(state.world_settings) + 1}",
+                    "tech_level": "由AI生成",
+                    "power_structure": summary or "待补充",
+                    "hidden_rules": summary or "待补充",
+                }
+            )
+            save_full_archive()
+            render_world_cards()
+            page.update()
+        except Exception as exc:
+            show_info_dialog(f"AI 生成世界卡失败：{exc}")
+        finally:
+            hide_loading(page)
 
     def on_generate_book_outline_only(_: ft.ControlEvent) -> None:
         idea = ""
@@ -1597,15 +2066,20 @@ def main(page: ft.Page) -> None:
         ai_book_outline_ring.visible = True
         outline_loading.visible = True
         set_status("AI 正在疯狂码字推演大纲中...")
+        show_loading(page, with_rules_hint("正在推演全书总纲..."))
         page.update()
         try:
             book = generate_book_outline(
                 idea,
                 model=state.models["supervisor"],
                 concept_proposal=state.concept_proposal,
+                mounted_rules=state.mounted_rules,
             )
             state.book_outline = book
-            render_outline_boards()
+            if state.project_name == "未命名脑洞" and book.book_title.strip():
+                state.project_name = book.book_title.strip()
+            refresh_all_views(page, state)
+            save_full_archive()
             book_outline_box.visible = True
             set_stage(STAGE_OUTLINE)
             outlining_status.value = "状态：全书总纲推演完成。"
@@ -1616,12 +2090,13 @@ def main(page: ft.Page) -> None:
             ai_book_outline_btn.disabled = False
             ai_book_outline_ring.visible = False
             outline_loading.visible = False
+            hide_loading(page)
             page.update()
 
     def on_generate_volume_outline_only(_: ft.ControlEvent) -> None:
         if state.book_outline is None:
-            outlining_status.value = "状态：请先推演全书总纲。"
-            page.update()
+            show_info_dialog("请先完成或加载全书总纲")
+            set_status("请先完成或加载全书总纲。")
             return
         try:
             target_volume_num = int(volume_num_input.value or "1")
@@ -1633,28 +2108,30 @@ def main(page: ft.Page) -> None:
         ai_volume_outline_ring.visible = True
         outline_loading.visible = True
         set_status("AI 正在疯狂码字推演大纲中...")
+        show_loading(page, with_rules_hint("正在推演分卷大纲..."))
         page.update()
         try:
             volume = generate_volume_outline(
                 book_outline=state.book_outline,
                 target_volume_num=target_volume_num,
                 model=state.models["supervisor"],
+                mounted_rules=state.mounted_rules,
             )
             state.volumes[target_volume_num] = volume
-            state.selected_volume_num = target_volume_num
-            state.volume_outline = volume
-            state.chapter_outline = state.chapter_outlines.get(target_volume_num)
-            render_volume_cards()
-            render_outline_boards()
-            volume_outline_box.visible = True
+            on_select_volume(target_volume_num, refresh_page=False)
+            refresh_all_views(page, state)
+            save_full_archive()
             set_stage(STAGE_CHAPTERS)
             outlining_status.value = "状态：分卷大纲推演完成。"
+            set_status(f"已完成第 {target_volume_num} 卷推演并自动选中。")
         except Exception as exc:
             outlining_status.value = f"状态：分卷大纲推演失败 - {exc}"
+            show_info_dialog(f"分卷推演失败：{exc}")
         finally:
             ai_volume_outline_btn.disabled = False
             ai_volume_outline_ring.visible = False
             outline_loading.visible = False
+            hide_loading(page)
             page.update()
 
     def on_generate_chapters_and_enter(_: ft.ControlEvent) -> None:
@@ -1675,12 +2152,14 @@ def main(page: ft.Page) -> None:
         ai_chapters_ring.visible = True
         outline_loading.visible = True
         set_status("AI 正在疯狂码字推演大纲中...")
+        show_loading(page, with_rules_hint("正在推演单章脑洞列表..."))
         page.update()
         try:
             chapters = generate_chapter_ideas(
                 volume_outline=state.volume_outline,
                 chapter_count=chapter_count,
                 model=state.models["supervisor"],
+                mounted_rules=state.mounted_rules,
             )
             state.chapter_outline = chapters
             if state.selected_volume_num is not None:
@@ -1689,6 +2168,7 @@ def main(page: ft.Page) -> None:
             sync_chapter_picker()
             sync_outline_visibility()
             render_chapter_cards()
+            save_full_archive()
             set_stage(STAGE_CHAPTERS)
             outlining_status.value = "状态：已进入 CHAPTERS 阶段。"
             set_status("已生成单章脑洞并切换到 CHAPTERS 阶段。")
@@ -1698,6 +2178,7 @@ def main(page: ft.Page) -> None:
             ai_chapters_btn.disabled = False
             ai_chapters_ring.visible = False
             outline_loading.visible = False
+            hide_loading(page)
             page.update()
 
     def on_generate_outline(_: ft.ControlEvent) -> None:
@@ -1721,14 +2202,18 @@ def main(page: ft.Page) -> None:
         set_stage(STAGE_OUTLINE)
         outlining_status.value = "状态：正在生成全书总纲..."
         set_status("正在连接 DeepSeek 脑回路...")
+        show_loading(page, with_rules_hint("正在生成全书总纲与人设..."))
         page.update()
         try:
             book = generate_book_outline(
                 idea,
                 model=state.models["supervisor"],
                 concept_proposal=state.concept_proposal,
+                mounted_rules=state.mounted_rules,
             )
             state.book_outline = book
+            if state.project_name == "未命名脑洞" and book.book_title.strip():
+                state.project_name = book.book_title.strip()
             try:
                 state.active_traits = derive_initial_traits(
                     user_idea=idea,
@@ -1754,6 +2239,7 @@ def main(page: ft.Page) -> None:
             set_stage(STAGE_OUTLINE)
             outlining_status.value = "状态：全书总纲生成完成。"
             set_status("全书总纲生成完成，可前往分卷与章节。")
+            save_full_archive()
         except Exception as exc:
             outlining_status.value = f"状态：生成失败 - {exc}"
             set_status("大纲生成失败。")
@@ -1762,6 +2248,7 @@ def main(page: ft.Page) -> None:
             gen_outline_btn.text = "🚀 确定，生成总纲"
             gen_outline_ring.visible = False
             outline_loading.visible = False
+            hide_loading(page)
             page.update()
 
     def on_apply_outline_text(_: ft.ControlEvent) -> None:
@@ -1792,8 +2279,9 @@ def main(page: ft.Page) -> None:
         run_pipeline_btn.text = "正在处理..."
         run_pipeline_ring.visible = True
         pipeline_progress.visible = True
-        pipeline_status.value = "状态：正在读取番茄节奏规则..."
-        set_status("正在读取番茄节奏规则...")
+        pipeline_status.value = "状态：正在加载挂载法则..."
+        set_status("正在加载挂载法则...")
+        show_loading(page, with_rules_hint("正在执行章节流水线..."))
         pipeline_output.value = ""
         pipeline_stream.controls = []
         page.update()
@@ -1807,7 +2295,7 @@ def main(page: ft.Page) -> None:
                 chapter_num=chapter_num,
                 idea=idea,
                 traits=state.active_traits,
-                platform=pipeline_platform_dropdown.value or "番茄小说",
+                mounted_rules=state.mounted_rules,
                 planner_model=state.models["planner"],
                 drafter_model=state.models["drafter"],
                 checker_model=state.models["checker"],
@@ -1815,12 +2303,16 @@ def main(page: ft.Page) -> None:
             pipeline_output.value = final_text
             pipeline_stream.controls = [ft.Text(line) for line in final_text.splitlines()]
             request_focus(pipeline_output)
+            current_volume = state.selected_volume_num if state.selected_volume_num is not None else 0
+            text_key = f"{current_volume}:{chapter_num}"
+            save_chapter_text(text_key, final_text)
             state.chapter_state = {
                 "chapter_num": chapter_num,
                 "chapter_idea": idea,
                 "checker_feedback": "",
                 "retry_count": 0,
             }
+            save_full_archive()
             pipeline_status.value = "状态：生成完成。"
             set_status("章节生成完成。")
         except Exception as exc:
@@ -1831,6 +2323,7 @@ def main(page: ft.Page) -> None:
             run_pipeline_btn.text = "🔥 启动流水线"
             run_pipeline_ring.visible = False
             pipeline_progress.visible = False
+            hide_loading(page)
             page.update()
 
     def on_save_settings(_: ft.ControlEvent) -> None:
@@ -1852,31 +2345,6 @@ def main(page: ft.Page) -> None:
         save_settings_btn.disabled = False
         save_settings_btn.text = "保存 API 与模型"
         save_settings_ring.visible = False
-        page.update()
-
-    def on_save_pacing_rules(_: ft.ControlEvent) -> None:
-        save_pacing_btn.disabled = True
-        save_pacing_btn.text = "正在处理..."
-        save_pacing_ring.visible = True
-        try:
-            parsed = json.loads(tomato_json_box.value or "{}")
-        except json.JSONDecodeError as exc:
-            settings_status.value = f"状态：tomato.json 预览格式错误 - {exc}"
-            save_pacing_btn.disabled = False
-            save_pacing_btn.text = "保存节奏规则"
-            save_pacing_ring.visible = False
-            page.update()
-            return
-        tomato_data.update(parsed)
-        current_rules = [field.value or "" for field in pacing_rules_box.controls]
-        tomato_data["pacing_rules"] = [rule for rule in current_rules if rule.strip()]
-        save_tomato()
-        load_tomato()
-        settings_status.value = "状态：节奏规则已保存。"
-        set_status("平台规则已持久化。")
-        save_pacing_btn.disabled = False
-        save_pacing_btn.text = "保存节奏规则"
-        save_pacing_ring.visible = False
         page.update()
 
     start_brainstorm_btn = ft.Button(
@@ -1907,19 +2375,29 @@ def main(page: ft.Page) -> None:
         height=52,
     )
     refresh_entities_btn = ft.OutlinedButton("刷新档案", on_click=refresh_entity_view)
+    add_character_btn = ft.Button(
+        "➕ 新建人物卡",
+        on_click=on_add_character_card,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
+    )
+    ai_character_btn = ft.Button(
+        "🤖 AI 生成人物卡",
+        on_click=on_ai_generate_character_card,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+    )
+    add_world_btn = ft.Button(
+        "➕ 新建世界卡",
+        on_click=on_add_world_card,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
+    )
+    ai_world_btn = ft.Button(
+        "🤖 AI 生成世界卡",
+        on_click=on_ai_generate_world_card,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+    )
     save_settings_btn = ft.Button(
         "保存 API 与模型",
         on_click=on_save_settings,
-        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
-    )
-    save_pacing_btn = ft.Button(
-        "保存节奏规则",
-        on_click=on_save_pacing_rules,
-        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
-    )
-    add_banned_word_btn = ft.Button(
-        "新增违禁词",
-        on_click=on_add_banned_word,
         style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_400, color=ft.Colors.WHITE),
     )
     add_model_btn = ft.Button(
@@ -1951,6 +2429,17 @@ def main(page: ft.Page) -> None:
         "🤖 AI 推演单章脑洞列表",
         on_click=on_generate_chapters_and_enter,
         style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+    )
+    extract_rule_btn = ft.Button(
+        "🔥 AI 深度提炼",
+        on_click=on_extract_rule,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.BLUE_700, color=ft.Colors.WHITE),
+    )
+    save_rule_btn.on_click = on_save_rule
+    outline_to_chapters_btn = ft.Button(
+        "➡️ 前往分卷与章节",
+        on_click=on_nav_to_chapters,
+        style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_700, color=ft.Colors.WHITE),
     )
     ai_book_outline_ring = ft.ProgressRing(visible=False, width=16, height=16, color=ft.Colors.BLUE_400)
     ai_volume_outline_ring = ft.ProgressRing(visible=False, width=16, height=16, color=ft.Colors.BLUE_400)
@@ -2005,10 +2494,6 @@ def main(page: ft.Page) -> None:
     global_console_row = ft.Row(
         controls=[
             save_chat_btn,
-            archive_filter_dropdown,
-            archive_dropdown,
-            refresh_archives_btn,
-            load_archive_btn,
             stage_jump_dropdown,
             clear_chat_btn,
         ],
@@ -2031,14 +2516,12 @@ def main(page: ft.Page) -> None:
     gen_outline_ring = ft.ProgressRing(visible=False, width=16, height=16, color=ft.Colors.BLUE_400)
     run_pipeline_ring = ft.ProgressRing(visible=False, width=16, height=16, color=ft.Colors.BLUE_400)
     save_settings_ring = ft.ProgressRing(visible=False, width=16, height=16, color=ft.Colors.BLUE_400)
-    save_pacing_ring = ft.ProgressRing(visible=False, width=16, height=16, color=ft.Colors.BLUE_400)
     outline_primary_row = ft.Row(
         [start_brainstorm_btn, start_brainstorm_ring, finalize_proposal_btn, finalize_proposal_ring, gen_outline_btn, gen_outline_ring],
         spacing=8,
     )
     pipeline_run_row = ft.Row([run_pipeline_btn, run_pipeline_ring], spacing=8)
     settings_save_row = ft.Row([save_settings_btn, save_settings_ring], spacing=8)
-    pacing_save_row = ft.Row([save_pacing_btn, save_pacing_ring], spacing=8)
     spark_row.controls = [
         ft.Button(
             "帮我补充反派设定",
@@ -2057,6 +2540,145 @@ def main(page: ft.Page) -> None:
         ),
     ]
     tabs_ref: dict[str, ft.Tabs | None] = {"tabs": None}
+    home_tabs_ref: dict[str, ft.Tabs | None] = {"tabs": None}
+    home_view_ref: dict[str, ft.Container | None] = {"view": None}
+    workspace_view_ref: dict[str, ft.Container | None] = {"view": None}
+    workspace_project_title = ft.Text("当前项目：未命名脑洞", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_300)
+    project_grid = ft.GridView(
+        expand=True,
+        runs_count=3,
+        max_extent=420,
+        child_aspect_ratio=2.6,
+        spacing=12,
+        run_spacing=12,
+    )
+    home_empty_hint = ft.Text("暂无项目，点击“➕ 创建新书”开始。", color=ft.Colors.BLUE_GREY_300)
+
+    def on_main_tabs_change(event: ft.ControlEvent) -> None:
+        selected_idx = int(getattr(event.control, "selected_index", 0) or 0)
+        if selected_idx == 0 and state.current_stage == STAGE_CHAPTERS:
+            refresh_all_views(page, state)
+            page.update()
+        if selected_idx == 1:
+            render_character_cards()
+            render_world_cards()
+            render_item_cards()
+            page.update()
+
+    def on_home_tabs_change(event: ft.ControlEvent) -> None:
+        selected_idx = int(getattr(event.control, "selected_index", 0) or 0)
+        if selected_idx == 0:
+            render_project_shelf()
+        if selected_idx == 1:
+            reload_local_rules()
+            render_rule_result(latest_rule_ref.get("rule"))
+        page.update()
+
+    def sync_workspace_project_title() -> None:
+        workspace_project_title.value = f"当前项目：{get_project_name()}"
+
+    def show_workspace_view() -> None:
+        reload_local_rules()
+        sync_workspace_project_title()
+        refresh_all_views(page, state)
+        set_stage(state.current_stage)
+        if home_view_ref["view"] is not None:
+            home_view_ref["view"].visible = False
+        if workspace_view_ref["view"] is not None:
+            workspace_view_ref["view"].visible = True
+        page.update()
+
+    def render_project_shelf() -> None:
+        cards: list[ft.Control] = []
+        for path, project_name, saved_at in list_projects():
+            time_text = saved_at[0:19].replace("T", " ")
+
+            def on_open(_: ft.ControlEvent, project_path: Path = path) -> None:
+                meta_path = resolve_project_meta_path(project_path)
+                if not meta_path.exists():
+                    show_info_dialog("项目元数据不存在。")
+                    return
+                try:
+                    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    show_info_dialog(f"项目读取失败：{exc}")
+                    return
+                hydrate_state_from_payload(payload, fallback_project_name=project_path.name)
+                set_status(f"项目《{state.project_name}》已加载。")
+                show_workspace_view()
+
+            cards.append(
+                ft.Card(
+                    content=ft.Container(
+                        padding=12,
+                        on_click=on_open,
+                        content=ft.Column(
+                            controls=[
+                                ft.Text(project_name, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_300),
+                                ft.Text(f"最后修改：{time_text}", size=12, color=ft.Colors.BLUE_GREY_300),
+                            ],
+                            spacing=6,
+                        ),
+                    )
+                )
+            )
+        project_grid.controls = cards
+        home_empty_hint.visible = not bool(cards)
+
+    def show_home_view() -> None:
+        render_project_shelf()
+        if home_view_ref["view"] is not None:
+            home_view_ref["view"].visible = True
+        if workspace_view_ref["view"] is not None:
+            workspace_view_ref["view"].visible = False
+        page.update()
+
+    def on_back_to_home(_: ft.ControlEvent) -> None:
+        save_full_archive()
+        show_home_view()
+
+    def on_create_new_project(_: ft.ControlEvent) -> None:
+        project_input = ft.TextField(label="书名", autofocus=True)
+
+        def on_confirm_create(_: ft.ControlEvent) -> None:
+            raw_name = (project_input.value or "").strip()
+            project_name = raw_name or "未命名脑洞"
+            state.project_name = project_name
+            state.chat_history = []
+            state.quick_options = []
+            state.concept_proposal = None
+            state.book_outline = None
+            state.volumes = {}
+            state.chapter_outlines = {}
+            state.chapter_texts = {}
+            state.chapter_files = {}
+            state.selected_volume_num = None
+            state.volume_outline = None
+            state.chapter_outline = None
+            state.characters = []
+            state.world_settings = []
+            state.items = []
+            state.mounted_rules = []
+            state.active_traits = load_default_traits()
+            state.current_stage = STAGE_CONCEPT
+            save_full_archive()
+            dialog.open = False
+            set_status(f"已创建项目《{project_name}》。")
+            show_workspace_view()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("创建新书"),
+            content=project_input,
+            actions=[
+                ft.TextButton("取消", on_click=lambda _: setattr(dialog, "open", False)),
+                ft.TextButton("创建", on_click=on_confirm_create),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
 
     def open_fullscreen_editor(title: str, target: ft.TextField) -> None:
         editor = ft.TextField(value=target.value, multiline=True, min_lines=25, max_lines=35, expand=True)
@@ -2133,6 +2755,7 @@ def main(page: ft.Page) -> None:
                             content=ft.Column(
                                 controls=[
                                     ft.Row([ai_book_outline_btn, ai_book_outline_ring], wrap=True),
+                                    ft.Row([outline_to_chapters_btn], alignment=ft.MainAxisAlignment.END),
                                     ft.Row(
                                         [
                                             ft.Text("全书总纲", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
@@ -2177,6 +2800,8 @@ def main(page: ft.Page) -> None:
                     content=ft.Column(
                         controls=[
                             ft.Text("章节规划", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                            book_outline_mount_status,
+                            book_outline_context_box,
                             selected_volume_title,
                             ft.Row(
                                 [
@@ -2230,7 +2855,14 @@ def main(page: ft.Page) -> None:
                     active_identity_input,
                     active_vision_input,
                     save_active_traits_btn,
-                    entity_panel,
+                    ft.Row([add_character_btn, ai_character_btn], wrap=True),
+                    ft.Text("人物卡", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                    character_cards_box,
+                    ft.Row([add_world_btn, ai_world_btn], wrap=True),
+                    ft.Text("世界卡", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                    world_cards_box,
+                    ft.Text("剧情锚点/金手指", size=18, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                    item_cards_box,
                 ],
                 spacing=12,
                 expand=True,
@@ -2249,7 +2881,6 @@ def main(page: ft.Page) -> None:
                                 chapter_picker,
                                 chapter_num_input,
                                 chapter_idea_input,
-                                pipeline_platform_dropdown,
                                 pipeline_run_row,
                             ],
                             spacing=12,
@@ -2283,14 +2914,6 @@ def main(page: ft.Page) -> None:
                     ft.Row([drafter_mapping_dropdown, checker_mapping_dropdown], expand=True),
                     settings_save_row,
                     settings_status,
-                    ft.Text("Visual Platform Config", weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-                    tomato_json_box,
-                    ft.Text("pacing_rules", weight=ft.FontWeight.BOLD),
-                    pacing_rules_box,
-                    ft.Text("banned_words", weight=ft.FontWeight.BOLD),
-                    banned_words_wrap,
-                    ft.Row([banned_word_input, add_banned_word_btn]),
-                    pacing_save_row,
                 ],
                 spacing=12,
                 scroll=ft.ScrollMode.AUTO,
@@ -2298,8 +2921,35 @@ def main(page: ft.Page) -> None:
             ),
         )
 
+    rule_forge_content = ft.Container(
+        padding=12,
+        content=ft.Column(
+            controls=[
+                ft.Text("⚖️ 法则炼金炉", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                rule_source_input,
+                ft.Row([rule_category_dropdown, element_target_input], wrap=True),
+                ft.Row(
+                    [
+                        extract_rule_btn,
+                        save_rule_btn,
+                        ft.OutlinedButton("刷新本地法则", on_click=lambda _: (reload_local_rules(), page.update())),
+                    ],
+                    wrap=True,
+                ),
+                rule_name_preview,
+                ft.Text("Positive Inclusions", weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN_300),
+                rule_positive_box,
+                ft.Text("Negative Constraints", weight=ft.FontWeight.BOLD, color=ft.Colors.RED_300),
+                rule_negative_box,
+            ],
+            spacing=10,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        ),
+    )
+
     tabs = ft.Tabs(
-        length=4,
+        length=3,
         selected_index=0,
         animation_duration=200,
         expand=True,
@@ -2312,7 +2962,6 @@ def main(page: ft.Page) -> None:
                         ft.Tab(label="创世灵感"),
                         ft.Tab(label="赛博档案"),
                         ft.Tab(label="写作工坊"),
-                        ft.Tab(label="系统设置"),
                     ],
                 ),
                 ft.TabBarView(
@@ -2321,6 +2970,78 @@ def main(page: ft.Page) -> None:
                         outlining_content,
                         entities_content,
                         pipeline_content,
+                    ],
+                ),
+            ],
+            expand=True,
+            spacing=8,
+        ),
+    )
+    tabs.on_change = on_main_tabs_change
+    tabs_ref["tabs"] = tabs
+    workspace_toolbar = ft.Row(
+        controls=[
+            ft.Button("⬅️ 返回书架", on_click=on_back_to_home),
+            ft.Button("🎒 配置战术背包", on_click=on_open_rule_mount_panel),
+            workspace_project_title,
+            theme_toggle_btn,
+        ],
+        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+    )
+    workspace_container = ft.Container(
+        visible=False,
+        expand=True,
+        content=ft.Column(
+            controls=[workspace_toolbar, tabs, status_label],
+            spacing=8,
+            expand=True,
+        ),
+    )
+    home_projects_content = ft.Container(
+        expand=True,
+        padding=12,
+        content=ft.Column(
+            controls=[
+                ft.Row(
+                    controls=[
+                        ft.Text("NovelCraft 书架", size=24, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
+                        ft.Button(
+                            "➕ 创建新书",
+                            on_click=on_create_new_project,
+                            style=ft.ButtonStyle(bgcolor=ft.Colors.GREEN_700, color=ft.Colors.WHITE),
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                home_empty_hint,
+                project_grid,
+            ],
+            spacing=12,
+            expand=True,
+        ),
+    )
+    home_tabs = ft.Tabs(
+        length=3,
+        selected_index=0,
+        animation_duration=200,
+        expand=True,
+        on_change=on_home_tabs_change,
+        content=ft.Column(
+            controls=[
+                ft.TabBar(
+                    indicator_color=ft.Colors.BLUE_400,
+                    label_color=ft.Colors.BLUE_400,
+                    tabs=[
+                        ft.Tab(label="📚 我的书架"),
+                        ft.Tab(label="⚖️ 法则炼金炉"),
+                        ft.Tab(label="⚙️ 系统设置"),
+                    ],
+                ),
+                ft.TabBarView(
+                    expand=True,
+                    controls=[
+                        home_projects_content,
+                        rule_forge_content,
                         settings_content,
                     ],
                 ),
@@ -2329,11 +3050,12 @@ def main(page: ft.Page) -> None:
             spacing=8,
         ),
     )
-    tabs_ref["tabs"] = tabs
+    home_tabs_ref["tabs"] = home_tabs
+    home_container = ft.Container(visible=True, expand=True, content=home_tabs)
+    home_view_ref["view"] = home_container
+    workspace_view_ref["view"] = workspace_container
 
-    load_tomato()
     refresh_entity_view()
-    restored_chat = load_chat_from_cache()
     refresh_chat_view(persist=False)
     render_quick_options()
     sync_proposal_board()
@@ -2346,16 +3068,10 @@ def main(page: ft.Page) -> None:
     refresh_archive_options()
     set_stage(STAGE_CONCEPT)
     sync_theme_toggle()
-    if restored_chat:
-        set_status("已恢复上次未完成的头脑风暴。")
-    top_bar = ft.Row(
-        controls=[
-            ft.Text("NovelCraft OS - 赛博编辑部", size=20, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_400),
-            theme_toggle_btn,
-        ],
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-    )
-    page.add(ft.Column(controls=[top_bar, tabs, status_label], spacing=8, expand=True))
+    reload_local_rules()
+    render_rule_result(None)
+    render_project_shelf()
+    page.add(ft.Column(controls=[home_container, workspace_container], spacing=8, expand=True))
 
 
 if __name__ == "__main__":

@@ -6,13 +6,13 @@ from agents.checker import check_consistency
 from agents.drafter import draft_chapter
 from agents.planner import plan_chapter_beats
 from core.config import FAST_MODEL, SMART_MODEL
-from core.schemas import ChapterBeatTemplate, NLPBaseTraits
+from core.schemas import ChapterBeatTemplate, NLPBaseTraits, WritingRule
 
 
 class ChapterState(TypedDict):
     chapter_num: int
     chapter_idea: str
-    platform: str
+    mounted_rules: list[WritingRule]
     traits: NLPBaseTraits
     beats: Optional[ChapterBeatTemplate]
     draft: str
@@ -28,7 +28,7 @@ def plan_node(state: ChapterState) -> ChapterState:
         chapter_number=state["chapter_num"],
         chapter_idea=state["chapter_idea"],
         character_traits=state["traits"],
-        platform=state["platform"],
+        mounted_rules=state["mounted_rules"],
         model=state["planner_model"],
     )
     return {**state, "beats": beats}
@@ -42,7 +42,7 @@ def draft_node(state: ChapterState) -> ChapterState:
         chapter_number=state["chapter_num"],
         beats=beats,
         character_traits=state["traits"],
-        platform=state["platform"],
+        mounted_rules=state["mounted_rules"],
         checker_feedback=state["checker_feedback"],
         model=state["drafter_model"],
     )
@@ -97,7 +97,7 @@ def run_chapter_pipeline(
     chapter_num: int,
     idea: str,
     traits: NLPBaseTraits,
-    platform: str = "番茄小说",
+    mounted_rules: list[WritingRule] | None = None,
     planner_model: str = SMART_MODEL,
     drafter_model: str = SMART_MODEL,
     checker_model: str = FAST_MODEL,
@@ -106,7 +106,7 @@ def run_chapter_pipeline(
         {
             "chapter_num": chapter_num,
             "chapter_idea": idea,
-            "platform": platform,
+            "mounted_rules": mounted_rules or [],
             "traits": traits,
             "beats": None,
             "draft": "",

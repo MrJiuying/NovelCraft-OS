@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -134,6 +134,33 @@ class ConceptProposal(BaseModel):
     world_tone: str = Field(
         ...,
         description="世界基调，定义作品整体气质与叙事风格方向。",
+    )
+
+
+class WritingRule(BaseModel):
+    rule_id: str = Field(
+        ...,
+        description="写作法则唯一标识，建议使用时间戳或 UUID。",
+    )
+    rule_name: str = Field(
+        ...,
+        description="法则名称，例如番茄黄金三章或极简短句排版。",
+    )
+    category: Literal["Elements", "Theories", "Taboos", "Formatting", "Lore", "Tropes"] = Field(
+        ...,
+        description="法则类别，限定为 Elements/Theories/Taboos/Formatting/Lore/Tropes。",
+    )
+    applicable_stage: Literal["全局", "总纲", "卷纲", "章纲", "正文"] = Field(
+        ...,
+        description="法则适用阶段。",
+    )
+    positive_instructions: List[str] = Field(
+        ...,
+        description="AI 必须执行的正向指导动作列表。",
+    )
+    negative_constraints: List[str] = Field(
+        ...,
+        description="AI 绝对禁止触犯的负向约束列表。",
     )
 
 
