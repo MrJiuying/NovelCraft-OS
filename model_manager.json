@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "alias": "smart-default",
+      "api_key": "sk-75294f137c5f49a5b344e6823e69be1e",
+      "base_url": "",
+      "model_name": "deepseek/deepseek-chat"
+    },
+    {
+      "alias": "fast-default",
+      "api_key": "sk-75294f137c5f49a5b344e6823e69be1e",
+      "base_url": "",
+      "model_name": "deepseek/deepseek-chat"
+    }
+  ],
+  "agent_mapping": {
+    "supervisor": "smart-default",
+    "planner": "smart-default",
+    "drafter": "smart-default",
+    "checker": "fast-default"
+  }
+}
