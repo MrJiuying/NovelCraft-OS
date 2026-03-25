@@ -18,7 +18,7 @@ model_manager.json
 *.db
 *.sqlite3
 *.sqlite
-data/
+data/ 
 temp_generations/
 
 # 4. Python 编译缓存 (垃圾文件)

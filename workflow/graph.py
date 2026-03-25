@@ -1,6 +1,6 @@
 import logging
 from time import perf_counter
-from typing import Optional, TypedDict
+from typing import Callable, Optional, TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
@@ -27,10 +27,16 @@ class ChapterState(TypedDict):
     planner_model: str
     drafter_model: str
     checker_model: str
+    project_name: str
+    volume_num: int
+    progress_callback: Optional[Callable[[str], None]]
 
 
 def plan_node(state: ChapterState) -> ChapterState:
     start = perf_counter()
+    callback = state.get("progress_callback")
+    if callback is not None:
+        callback("planner_start")
     logger.info(
         "pipeline.%s.plan.start chapter=%s rules=%s model=%s",
         state["pipeline_id"],
@@ -52,11 +58,16 @@ def plan_node(state: ChapterState) -> ChapterState:
         state["chapter_num"],
         duration_ms,
     )
+    if callback is not None:
+        callback("planner_done")
     return {**state, "beats": beats}
 
 
 def draft_node(state: ChapterState) -> ChapterState:
     start = perf_counter()
+    callback = state.get("progress_callback")
+    if callback is not None:
+        callback("drafter_start")
     logger.info(
         "pipeline.%s.draft.start chapter=%s retry_count=%s model=%s",
         state["pipeline_id"],
@@ -74,6 +85,8 @@ def draft_node(state: ChapterState) -> ChapterState:
         mounted_rules=state["mounted_rules"],
         checker_feedback=state["checker_feedback"],
         model=state["drafter_model"],
+        project_name=state["project_name"],
+        volume_number=state["volume_num"],
     )
     duration_ms = int((perf_counter() - start) * 1000)
     logger.info(
@@ -83,6 +96,8 @@ def draft_node(state: ChapterState) -> ChapterState:
         duration_ms,
         len(draft),
     )
+    if callback is not None:
+        callback("drafter_done")
     return {**state, "draft": draft}
 
 
@@ -168,6 +183,9 @@ def run_chapter_pipeline(
     planner_model: str = SMART_MODEL,
     drafter_model: str = SMART_MODEL,
     checker_model: str = FAST_MODEL,
+    project_name: str = "",
+    volume_num: int = 1,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     pipeline_id = uuid4().hex[:8]
     start = perf_counter()
@@ -195,6 +213,9 @@ def run_chapter_pipeline(
                 "planner_model": planner_model,
                 "drafter_model": drafter_model,
                 "checker_model": checker_model,
+                "project_name": project_name,
+                "volume_num": volume_num,
+                "progress_callback": progress_callback,
             }
         )
     except Exception:
